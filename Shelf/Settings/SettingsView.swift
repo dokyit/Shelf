@@ -1,5 +1,18 @@
+import AppKit
 import ShelfCore
 import SwiftUI
+
+private struct SidebarMaterial: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSVisualEffectView {
+        let view = NSVisualEffectView()
+        view.material = .sidebar
+        view.blendingMode = .behindWindow
+        view.state = .followsWindowActiveState
+        return view
+    }
+
+    func updateNSView(_ nsView: NSVisualEffectView, context: Context) {}
+}
 
 final class SettingsViewState: ObservableObject {
     @Published var page: SettingsView.Page = .layout
@@ -38,13 +51,33 @@ struct SettingsView: View {
     @StateObject private var state = SettingsViewState()
 
     var body: some View {
-        NavigationSplitView {
-            List(Page.allCases, selection: $state.page) { entry in
-                Label(entry.title, systemImage: entry.symbol).tag(entry)
+        HStack(spacing: 0) {
+            VStack(alignment: .leading, spacing: 2) {
+                ForEach(Page.allCases) { entry in
+                    Button {
+                        state.page = entry
+                    } label: {
+                        Label(entry.title, systemImage: entry.symbol)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.vertical, 6)
+                            .padding(.horizontal, 8)
+                            .background(
+                                RoundedRectangle(cornerRadius: 6)
+                                    .fill(state.page == entry ? Color.accentColor.opacity(0.22) : Color.clear)
+                            )
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                }
+                Spacer()
             }
-            .navigationSplitViewColumnWidth(min: 160, ideal: 185, max: 230)
-        } detail: {
+            .padding(8)
+            .frame(width: 185)
+            .frame(maxHeight: .infinity)
+            .background(SidebarMaterial())
+            Divider()
             detailView
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .frame(minWidth: 650, idealWidth: 840, minHeight: 460, idealHeight: 620)
     }
@@ -439,6 +472,15 @@ private struct BehaviorPage: View {
 
     var body: some View {
         Form {
+            Section("General") {
+                Toggle(
+                    "Open Shelf at login",
+                    isOn: Binding(
+                        get: { visibility.launchAtLogin },
+                        set: { visibility.setLaunchAtLogin($0) }
+                    )
+                )
+            }
             Section("Shelf panel") {
                 Toggle(
                     "Auto-close Shelf when clicking outside",

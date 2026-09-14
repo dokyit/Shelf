@@ -8,6 +8,11 @@ enum BridgeCapture {
     case snapshot(HostSnapshot, agentPID: pid_t)
 }
 
+enum MenuBarClickButton {
+    case left
+    case right
+}
+
 actor MenuBarAgentBridge {
     private var pressableByToken: [UInt64: AXUIElement] = [:]
     private var ownerPIDByToken: [UInt64: pid_t] = [:]
@@ -60,15 +65,26 @@ actor MenuBarAgentBridge {
         return .snapshot(HostSnapshot(groups: groups, overflowButtonFrame: overflowFrame), agentPID: agent)
     }
 
-    func pressItem(token: UInt64) async -> Bool {
+    func pressItem(token: UInt64, button: MenuBarClickButton = .left) async -> Bool {
         guard let element = pressableByToken[token] else { return false }
-        if AXUIElementPerformAction(element, kAXPressAction as CFString) == .success,
+        if button == .left,
+           AXUIElementPerformAction(element, kAXPressAction as CFString) == .success,
            await menuOpenedSoon(token: token) {
             return true
         }
         guard let frame = axFrame(of: element) else { return false }
-        guard click(at: CGPoint(x: frame.midX, y: frame.midY)) else { return false }
-        return await menuOpenedSoon(token: token)
+        guard click(at: CGPoint(x: frame.midX, y: frame.midY), button: button) else { return false }
+        if await menuOpenedSoon(token: token) { return true }
+        if button == .right {
+            if AXUIElementPerformAction(element, kAXPressAction as CFString) == .success,
+               await menuOpenedSoon(token: token) {
+                return true
+            }
+            guard let fresh = axFrame(of: element) else { return false }
+            guard click(at: CGPoint(x: fresh.midX, y: fresh.midY), button: .left) else { return false }
+            return await menuOpenedSoon(token: token)
+        }
+        return false
     }
 
     private func menuOpenedSoon(token: UInt64) async -> Bool {
@@ -79,14 +95,17 @@ actor MenuBarAgentBridge {
         return false
     }
 
-    private func click(at point: CGPoint) -> Bool {
+    private func click(at point: CGPoint, button: MenuBarClickButton = .left) -> Bool {
+        let downType: CGEventType = button == .left ? .leftMouseDown : .rightMouseDown
+        let upType: CGEventType = button == .left ? .leftMouseUp : .rightMouseUp
+        let cgButton: CGMouseButton = button == .left ? .left : .right
         let source = CGEventSource(stateID: .hidSystemState)
         guard let down = CGEvent(
-            mouseEventSource: source, mouseType: .leftMouseDown,
-            mouseCursorPosition: point, mouseButton: .left
+            mouseEventSource: source, mouseType: downType,
+            mouseCursorPosition: point, mouseButton: cgButton
         ), let up = CGEvent(
-            mouseEventSource: source, mouseType: .leftMouseUp,
-            mouseCursorPosition: point, mouseButton: .left
+            mouseEventSource: source, mouseType: upType,
+            mouseCursorPosition: point, mouseButton: cgButton
         ) else { return false }
         down.post(tap: .cghidEventTap)
         Thread.sleep(forTimeInterval: 0.05)

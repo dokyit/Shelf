@@ -129,8 +129,8 @@ final class MenuBarInventory: ObservableObject {
         )
     }
 
-    func pressItem(_ item: ManagedItem) async -> Bool {
-        await bridge.pressItem(token: item.elementToken)
+    func pressItem(_ item: ManagedItem, button: MenuBarClickButton = .left) async -> Bool {
+        await bridge.pressItem(token: item.elementToken, button: button)
     }
 
     func revealNativeOverflow() async -> Bool {

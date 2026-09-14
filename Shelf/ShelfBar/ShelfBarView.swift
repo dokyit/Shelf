@@ -1,5 +1,32 @@
+import AppKit
 import ShelfCore
 import SwiftUI
+
+private final class ClickSurface: NSView {
+    var onLeft: (() -> Void)?
+    var onRight: (() -> Void)?
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    override func mouseDown(with event: NSEvent) { onLeft?() }
+    override func rightMouseDown(with event: NSEvent) { onRight?() }
+}
+
+private struct ClickSurfaceRepresentable: NSViewRepresentable {
+    var onLeft: () -> Void
+    var onRight: () -> Void
+
+    func makeNSView(context: Context) -> ClickSurface {
+        let view = ClickSurface()
+        view.onLeft = onLeft
+        view.onRight = onRight
+        return view
+    }
+
+    func updateNSView(_ nsView: ClickSurface, context: Context) {
+        nsView.onLeft = onLeft
+        nsView.onRight = onRight
+    }
+}
 
 final class ShelfBarState: ObservableObject {
     @Published var search = ""
@@ -99,32 +126,31 @@ struct ShelfBarView: View {
     }
 
     private func tile(for item: ManagedItem) -> some View {
-        Button {
-            activate(item)
-        } label: {
-            VStack(spacing: 5) {
-                Image(nsImage: icons.icon(for: item))
-                    .resizable()
-                    .aspectRatio(contentMode: .fit)
-                    .frame(width: 24, height: 24)
-                Text(item.name)
-                    .font(.caption2)
-                    .lineLimit(2)
-                    .multilineTextAlignment(.center)
-                    .frame(maxWidth: .infinity)
-            }
-            .frame(width: 68, height: 60)
-            .contentShape(Rectangle())
+        VStack(spacing: 5) {
+            Image(nsImage: icons.icon(for: item))
+                .resizable()
+                .aspectRatio(contentMode: .fit)
+                .frame(width: 24, height: 24)
+            Text(item.name)
+                .font(.caption2)
+                .lineLimit(2)
+                .multilineTextAlignment(.center)
+                .frame(maxWidth: .infinity)
         }
-        .buttonStyle(.plain)
-        .help(item.name)
+        .frame(width: 68, height: 60)
+        .contentShape(Rectangle())
+        .overlay(ClickSurfaceRepresentable(
+            onLeft: { activate(item, button: .left) },
+            onRight: { activate(item, button: .right) }
+        ))
+        .help("\(item.name) — left-click to open, right-click for its menu")
         .accessibilityLabel("Open \(item.name)")
     }
 
-    private func activate(_ item: ManagedItem) {
+    private func activate(_ item: ManagedItem, button: MenuBarClickButton) {
         onClose()
         Task { @MainActor in
-            let result = await visibility.activateItem(item)
+            let result = await visibility.activateItem(item, button: button)
             switch result {
             case .success:
                 break

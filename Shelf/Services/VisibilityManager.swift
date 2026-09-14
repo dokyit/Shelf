@@ -1,5 +1,6 @@
 import AppKit
 import ApplicationServices
+import ServiceManagement
 import ShelfCore
 import ShelfNative
 
@@ -81,6 +82,7 @@ final class VisibilityManager: ObservableObject {
     private var pendingApply = false
     private var applyTask: Task<Void, Never>?
     private var revealWatchTask: Task<Void, Never>?
+    private var activatingScopes: Set<String> = []
     private var observers: [NSObjectProtocol] = []
     private var settingsHandler: (() -> Void)?
     private let inventoryBox = InventoryBox()
@@ -93,6 +95,20 @@ final class VisibilityManager: ObservableObject {
         set { defaults.set(newValue, forKey: Self.autoCloseKey) }
     }
 
+    @Published private(set) var launchAtLogin = false
+
+    func setLaunchAtLogin(_ enabled: Bool) {
+        do {
+            if enabled {
+                try SMAppService.mainApp.register()
+            } else {
+                try SMAppService.mainApp.unregister()
+            }
+        } catch {
+        }
+        launchAtLogin = SMAppService.mainApp.status == .enabled
+    }
+
     private(set) weak var inventory: MenuBarInventory?
 
     init() {
@@ -102,6 +118,7 @@ final class VisibilityManager: ObservableObject {
         layout = initial
         savedLayout = initial
         showShelfInMenuBar = UserDefaults.standard.bool(forKey: Self.showShelfInMenuBarKey)
+        launchAtLogin = SMAppService.mainApp.status == .enabled
         engine = VisibilityController(environment: VisibilityController.Environment(
             factory: NativeAssertionFactory(),
             ownBundleID: Bundle.main.bundleIdentifier ?? "com.pinnyutility.Shelf",
@@ -282,7 +299,7 @@ final class VisibilityManager: ObservableObject {
         )
     }
 
-    func activateItem(_ item: ManagedItem) async -> ItemActivationResult {
+    func activateItem(_ item: ManagedItem, button: MenuBarClickButton = .left) async -> ItemActivationResult {
         if item.isNativeOverflow && !currentHiddenScopes().contains(item.scope) {
             return .needsOverflowReveal
         }
@@ -313,14 +330,18 @@ final class VisibilityManager: ObservableObject {
                 }
                 return .failure("\(item.name) could not be brought into the menu bar.")
             }
-            let pressed = await inventory?.pressItem(target) ?? false
+            activatingScopes.insert(item.scope)
+            let pressed = await inventory?.pressItem(target, button: button) ?? false
+            activatingScopes.remove(item.scope)
             guard pressed else {
                 return .failure("\(item.name) is visible in the menu bar now — click it there.")
             }
             startRevealWatch(for: target)
             return .success
         }
-        let pressed = await inventory?.pressItem(item) ?? false
+        activatingScopes.insert(item.scope)
+        let pressed = await inventory?.pressItem(item, button: button) ?? false
+        activatingScopes.remove(item.scope)
         return pressed ? .success : .failure("Could not open \(item.name) right now.")
     }
 
@@ -333,7 +354,7 @@ final class VisibilityManager: ObservableObject {
         Task { @MainActor in
             try? await Task.sleep(nanoseconds: 500_000_000)
             guard !Task.isCancelled else { return }
-            for scope in temporarilyRevealedScopes {
+            for scope in temporarilyRevealedScopes where !activatingScopes.contains(scope) {
                 if let item = inventory?.items.first(where: { $0.scope == scope }),
                    await inventory?.hasOpenMenu(item) == true {
                     continue
