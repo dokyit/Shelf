@@ -133,6 +133,10 @@ final class MenuBarInventory: ObservableObject {
         await bridge.pressItem(token: item.elementToken, button: button)
     }
 
+    func dragItem(_ item: ManagedItem, toX x: CGFloat) async -> Bool {
+        await bridge.dragItem(token: item.elementToken, toX: x)
+    }
+
     func revealNativeOverflow() async -> Bool {
         await bridge.pressOverflow()
     }

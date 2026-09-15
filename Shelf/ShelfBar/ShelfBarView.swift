@@ -5,26 +5,53 @@ import SwiftUI
 private final class ClickSurface: NSView {
     var onLeft: (() -> Void)?
     var onRight: (() -> Void)?
+    var onDrag: ((CGFloat, Bool) -> Void)?
+    private var downX: CGFloat = 0
+    private var dragging = false
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
-    override func mouseDown(with event: NSEvent) { onLeft?() }
+
+    override func mouseDown(with event: NSEvent) {
+        downX = event.locationInWindow.x
+        dragging = false
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        guard let onDrag else { return }
+        let dx = event.locationInWindow.x - downX
+        if !dragging, abs(dx) > 5 { dragging = true }
+        if dragging { onDrag(dx, false) }
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        if dragging {
+            onDrag?(event.locationInWindow.x - downX, true)
+            dragging = false
+        } else {
+            onLeft?()
+        }
+    }
+
     override func rightMouseDown(with event: NSEvent) { onRight?() }
 }
 
 private struct ClickSurfaceRepresentable: NSViewRepresentable {
     var onLeft: () -> Void
     var onRight: () -> Void
+    var onDrag: ((CGFloat, Bool) -> Void)? = nil
 
     func makeNSView(context: Context) -> ClickSurface {
         let view = ClickSurface()
         view.onLeft = onLeft
         view.onRight = onRight
+        view.onDrag = onDrag
         return view
     }
 
     func updateNSView(_ nsView: ClickSurface, context: Context) {
         nsView.onLeft = onLeft
         nsView.onRight = onRight
+        nsView.onDrag = onDrag
     }
 }
 
@@ -32,6 +59,8 @@ final class ShelfBarState: ObservableObject {
     @Published var search = ""
     @Published var includeAlwaysHidden = false
     @Published var message: String?
+    @Published var dragOrder: [String] = []
+    @Published var dragStartIndex: Int?
 }
 
 struct ShelfBarView: View {
@@ -71,6 +100,25 @@ struct ShelfBarView: View {
         }
     }
 
+    private var alwaysHiddenItems: [ManagedItem] {
+        inventory.items
+            .filter {
+                $0.isPresent && $0.ownerPID != getpid()
+                    && visibility.layout.section(for: $0.scope) == .alwaysHide
+            }
+            .sorted {
+                let lo = visibility.layout.rules[$0.scope]?.order ?? .max
+                let ro = visibility.layout.rules[$1.scope]?.order ?? .max
+                if lo != ro { return lo < ro }
+                if $0.frame.width > 0, $1.frame.width > 0 { return $0.frame.minX < $1.frame.minX }
+                return $0.name < $1.name
+            }
+    }
+
+    private var hiddenScopeOrder: [String] {
+        state.dragOrder.isEmpty ? alwaysHiddenItems.map(\.scope) : state.dragOrder
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             if mode == .search {
@@ -94,6 +142,25 @@ struct ShelfBarView: View {
                     .padding(2)
                 }
                 .frame(maxHeight: 380)
+            }
+            if mode == .shelf && !alwaysHiddenItems.isEmpty {
+                Divider()
+                VStack(alignment: .leading, spacing: 6) {
+                    Label("Always Hide", systemImage: "eye.slash")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    HStack(spacing: 6) {
+                        ForEach(hiddenScopeOrder, id: \.self) { scope in
+                            if let item = alwaysHiddenItems.first(where: { $0.scope == scope }) {
+                                hiddenTile(for: item)
+                            }
+                        }
+                    }
+                    .animation(.default, value: hiddenScopeOrder)
+                    Text("Drag to rearrange their menu bar order.")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                }
             }
             if mode == .search {
                 Toggle("Include Always Hidden", isOn: $state.includeAlwaysHidden)
@@ -126,6 +193,25 @@ struct ShelfBarView: View {
     }
 
     private func tile(for item: ManagedItem) -> some View {
+        tileBody(for: item)
+            .overlay(ClickSurfaceRepresentable(
+                onLeft: { activate(item, button: .left) },
+                onRight: { activate(item, button: .right) }
+            ))
+    }
+
+    private func hiddenTile(for item: ManagedItem) -> some View {
+        tileBody(for: item)
+            .opacity(0.75)
+            .overlay(ClickSurfaceRepresentable(
+                onLeft: { activate(item, button: .left) },
+                onRight: { activate(item, button: .right) },
+                onDrag: { dx, ended in handleHiddenDrag(item, dx: dx, ended: ended) }
+            ))
+            .help("\(item.name) — drag to rearrange, click to open")
+    }
+
+    private func tileBody(for item: ManagedItem) -> some View {
         VStack(spacing: 5) {
             Image(nsImage: icons.icon(for: item))
                 .resizable()
@@ -139,12 +225,29 @@ struct ShelfBarView: View {
         }
         .frame(width: 68, height: 60)
         .contentShape(Rectangle())
-        .overlay(ClickSurfaceRepresentable(
-            onLeft: { activate(item, button: .left) },
-            onRight: { activate(item, button: .right) }
-        ))
         .help("\(item.name) — left-click to open, right-click for its menu")
         .accessibilityLabel("Open \(item.name)")
+    }
+
+    private func handleHiddenDrag(_ item: ManagedItem, dx: CGFloat, ended: Bool) {
+        if state.dragStartIndex == nil {
+            state.dragOrder = alwaysHiddenItems.map(\.scope)
+            state.dragStartIndex = state.dragOrder.firstIndex(of: item.scope)
+        }
+        guard let start = state.dragStartIndex else { return }
+        let delta = Int((dx / 74).rounded())
+        let to = max(0, min(state.dragOrder.count - 1, start + delta))
+        if let from = state.dragOrder.firstIndex(of: item.scope), to != from {
+            state.dragOrder.move(fromOffsets: IndexSet(integer: from), toOffset: to > from ? to + 1 : to)
+        }
+        if ended {
+            let finalOrder = state.dragOrder
+            state.dragOrder = []
+            state.dragStartIndex = nil
+            if finalOrder != alwaysHiddenItems.map(\.scope) {
+                visibility.reorderAlwaysHidden(finalOrder)
+            }
+        }
     }
 
     private func activate(_ item: ManagedItem, button: MenuBarClickButton) {

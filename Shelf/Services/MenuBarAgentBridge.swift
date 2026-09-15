@@ -87,6 +87,42 @@ actor MenuBarAgentBridge {
         return false
     }
 
+    func dragItem(token: UInt64, toX x: CGFloat) async -> Bool {
+        guard let element = pressableByToken[token] ?? elementsByToken[token],
+              let frame = axFrame(of: element),
+              frame.width > 0 else { return false }
+        let source = CGPoint(x: frame.midX, y: frame.midY)
+        let target = CGPoint(x: x, y: frame.midY)
+        let src = CGEventSource(stateID: .hidSystemState)
+        guard let down = CGEvent(
+            mouseEventSource: src, mouseType: .leftMouseDown,
+            mouseCursorPosition: source, mouseButton: .left
+        ) else { return false }
+        down.flags = .maskCommand
+        down.post(tap: .cghidEventTap)
+        try? await Task.sleep(nanoseconds: 400_000_000)
+        for step in 1...20 {
+            if Task.isCancelled { return false }
+            let t = CGFloat(step) / 20
+            let p = CGPoint(x: source.x + (target.x - source.x) * t, y: source.y)
+            guard let drag = CGEvent(
+                mouseEventSource: src, mouseType: .leftMouseDragged,
+                mouseCursorPosition: p, mouseButton: .left
+            ) else { return false }
+            drag.flags = .maskCommand
+            drag.post(tap: .cghidEventTap)
+            try? await Task.sleep(nanoseconds: 50_000_000)
+        }
+        try? await Task.sleep(nanoseconds: 200_000_000)
+        guard let up = CGEvent(
+            mouseEventSource: src, mouseType: .leftMouseUp,
+            mouseCursorPosition: target, mouseButton: .left
+        ) else { return false }
+        up.flags = .maskCommand
+        up.post(tap: .cghidEventTap)
+        return true
+    }
+
     private func menuOpenedSoon(token: UInt64) async -> Bool {
         for _ in 0..<8 {
             if hasOpenMenu(token: token) { return true }

@@ -349,6 +349,62 @@ final class VisibilityManager: ObservableObject {
         await inventory?.revealNativeOverflow() ?? false
     }
 
+    private var isReordering = false
+
+    func reorderAlwaysHidden(_ scopesInOrder: [String]) {
+        for (index, scope) in scopesInOrder.enumerated() {
+            if var rule = layout.rules[scope], rule.section == .alwaysHide {
+                rule.order = index
+                layout.rules[scope] = rule
+            }
+        }
+        savedLayout = layout
+        persist()
+        guard !isReordering, scopesInOrder.count > 1 else { return }
+        isReordering = true
+        Task { [weak self] in
+            await self?.applyHiddenOrderToBar(scopesInOrder)
+            self?.isReordering = false
+        }
+    }
+
+    private func applyHiddenOrderToBar(_ scopes: [String]) async {
+        guard accessibilityTrusted, blocker == nil else { return }
+        activatingScopes.formUnion(scopes)
+        temporarilyRevealedScopes.formUnion(scopes)
+        defer {
+            temporarilyRevealedScopes.subtract(scopes)
+            activatingScopes.subtract(scopes)
+            requestApply()
+        }
+        await applyLayout()
+        let deadline = Date().addingTimeInterval(3)
+        var present: [ManagedItem] = []
+        while Date() < deadline {
+            if let fresh = await inventory?.captureFreshItems() {
+                present = fresh.filter {
+                    scopes.contains($0.scope) && $0.isPresent && !$0.isNativeOverflow && $0.frame.width > 0
+                }
+                if present.count == scopes.count { break }
+            }
+            try? await Task.sleep(nanoseconds: 200_000_000)
+        }
+        guard present.count > 1 else { return }
+        for index in 1..<scopes.count {
+            guard let fresh = await inventory?.captureFreshItems(),
+                  let prev = fresh.first(where: { $0.scope == scopes[index - 1] }),
+                  let cur = fresh.first(where: { $0.scope == scopes[index] }),
+                  prev.isPresent, cur.isPresent,
+                  prev.frame.width > 0, cur.frame.width > 0,
+                  !prev.isNativeOverflow, !cur.isNativeOverflow else { continue }
+            if cur.frame.minX < prev.frame.minX {
+                let target = prev.frame.maxX + cur.frame.width / 2 + 6
+                _ = await inventory?.dragItem(cur, toX: target)
+                try? await Task.sleep(nanoseconds: 500_000_000)
+            }
+        }
+    }
+
     func noteOutsideClick() {
         guard !temporarilyRevealedScopes.isEmpty else { return }
         Task { @MainActor in

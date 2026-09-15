@@ -103,9 +103,9 @@ final class ShelfController: NSObject, ObservableObject {
     }
 
     @objc private func iconActivated(_ sender: NSStatusBarButton) {
-        guard let event = NSApp.currentEvent else { return }
-        let isContextClick = event.type == .rightMouseUp
-            || (event.type == .leftMouseUp && event.modifierFlags.contains(.control))
+        let event = NSApp.currentEvent
+        let isContextClick = event?.type == .rightMouseUp
+            || (event?.type == .leftMouseUp && event?.modifierFlags.contains(.control) == true)
         if isContextClick {
             showContextMenu()
         } else {
