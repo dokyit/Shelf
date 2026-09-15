@@ -129,6 +129,9 @@ private struct LayoutPage: View {
         presentItems
             .filter { effectiveSection(of: $0) == section }
             .sorted {
+                let lx = $0.frame.width > 0 ? $0.frame.minX : .greatestFiniteMagnitude
+                let rx = $1.frame.width > 0 ? $1.frame.minX : .greatestFiniteMagnitude
+                if lx != rx { return lx < rx }
                 let left = visibility.layout.rules[$0.scope]?.order ?? 0
                 let right = visibility.layout.rules[$1.scope]?.order ?? 0
                 return left == right ? $0.name < $1.name : left < right
