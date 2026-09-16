@@ -99,7 +99,8 @@ final class MenuBarInventory: ObservableObject {
                 let freshIDs = Set(fresh.map(\.id))
                 var seenIDs = Set<String>()
                 var nextCarried: [ManagedItem] = []
-                for item in carriedItems + lastEmitted where !freshIDs.contains(item.id) && seenIDs.insert(item.id).inserted {
+                for item in carriedItems + lastEmitted
+                where !item.id.hasPrefix("detached:") && !freshIDs.contains(item.id) && seenIDs.insert(item.id).inserted {
                     guard isRunning(item.ownerPID) else { continue }
                     guard hiddenScopesProvider().contains(item.scope) || item.isNativeOverflow else { continue }
                     var copy = item
@@ -158,20 +159,24 @@ final class MenuBarInventory: ObservableObject {
     // whenever a restriction is active, even when allowlisted — so they never
     // appear in the MenuBarAgent snapshot. They still expose an AXExtrasMenuBar
     // element on their own process; surface those so the user can see and
-    // manage them.
+    // manage them. Hidden items are already carried in `merged`, so only add
+    // extras elements beyond the count a pid already has — otherwise every
+    // hidden item would appear twice.
     private func detachedItems(representedBy merged: [ManagedItem], agentPID: pid_t) async -> [ManagedItem] {
+        var counts: [pid_t: Int] = [:]
+        for item in merged { counts[item.ownerPID, default: 0] += 1 }
         var result: [ManagedItem] = []
         for app in NSWorkspace.shared.runningApplications {
             let pid = app.processIdentifier
             guard pid > 0, pid != getpid(), pid != agentPID else { continue }
-            for (ordinal, extra) in await bridge.extrasElements(of: pid).enumerated() {
-                let mid = CGPoint(x: extra.frame.midX, y: extra.frame.midY)
-                let represented = merged.contains { $0.ownerPID == pid && $0.frame.contains(mid) }
-                guard !represented else { continue }
-                let info = appInfo(for: pid)
-                let scope = info.bundleID.map(ItemScope.app) ?? ItemScope.process(pid)
+            let extras = await bridge.extrasElements(of: pid)
+            let missing = extras.count - (counts[pid] ?? 0)
+            guard missing > 0 else { continue }
+            let info = appInfo(for: pid)
+            let scope = info.bundleID.map(ItemScope.app) ?? ItemScope.process(pid)
+            for (ordinal, extra) in extras.suffix(missing).enumerated() {
                 result.append(ManagedItem(
-                    id: "\(scope):detached\(ordinal)",
+                    id: "detached:\(scope):\(ordinal)",
                     scope: scope,
                     bundleID: info.bundleID,
                     systemIdentifier: nil,
