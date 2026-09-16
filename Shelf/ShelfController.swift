@@ -134,7 +134,12 @@ final class ShelfController: NSObject, ObservableObject {
         menu.addItem(.separator())
         addMenuItem(menu, title: "Quit Shelf", action: #selector(menuQuit), keyEquivalent: "q")
         if let button = iconItem.button {
-            menu.popUp(positioning: nil, at: NSPoint(x: 0, y: button.bounds.height + 4), in: button)
+            iconItem.menu = menu
+            button.performClick(nil)
+            Task { @MainActor [weak self] in
+                try? await Task.sleep(nanoseconds: 500_000_000)
+                self?.iconItem.menu = nil
+            }
         }
     }
 

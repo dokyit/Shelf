@@ -258,6 +258,26 @@ actor MenuBarAgentBridge {
         return labels.contains { $0 == MenuBarItemDiscovery.overflowButtonDescription }
     }
 
+    func extrasElements(of pid: pid_t) -> [(element: AXUIElement, frame: CGRect)] {
+        let app = AXUIElementCreateApplication(pid)
+        AXUIElementSetMessagingTimeout(app, 0.15)
+        var extras: AnyObject?
+        guard AXUIElementCopyAttributeValue(app, "AXExtrasMenuBar" as CFString, &extras) == .success,
+              let extrasElement = extras as! AXUIElement? else { return [] }
+        return axChildren(of: extrasElement).compactMap { child in
+            guard let frame = axFrame(of: child) else { return nil }
+            return (child, frame)
+        }
+    }
+
+    func registerDetached(_ element: AXUIElement, ownerPID: pid_t) -> UInt64 {
+        let token = UInt64(CFHash(element))
+        elementsByToken[token] = element
+        pressableByToken[token] = element
+        ownerPIDByToken[token] = ownerPID
+        return token
+    }
+
     private func resolveExtrasElement(ownerPID: pid_t, groupFrame: CGRect) -> AXUIElement? {
         let app = AXUIElementCreateApplication(ownerPID)
         var extras: AnyObject?

@@ -108,6 +108,7 @@ final class MenuBarInventory: ObservableObject {
                 }
                 carriedItems = nextCarried
                 merged.append(contentsOf: nextCarried)
+                merged.append(contentsOf: await detachedItems(representedBy: merged, agentPID: agentPID))
             } else {
                 carriedItems = []
             }
@@ -151,6 +152,39 @@ final class MenuBarInventory: ObservableObject {
         let info = MenuBarAppInfo(bundleID: app?.bundleIdentifier, localizedName: app?.localizedName)
         appInfoCache[pid] = info
         return info
+    }
+
+    // Locally-signed apps (local.* bundles) are evicted from the bar by macOS
+    // whenever a restriction is active, even when allowlisted — so they never
+    // appear in the MenuBarAgent snapshot. They still expose an AXExtrasMenuBar
+    // element on their own process; surface those so the user can see and
+    // manage them.
+    private func detachedItems(representedBy merged: [ManagedItem], agentPID: pid_t) async -> [ManagedItem] {
+        var result: [ManagedItem] = []
+        for app in NSWorkspace.shared.runningApplications {
+            let pid = app.processIdentifier
+            guard pid > 0, pid != getpid(), pid != agentPID else { continue }
+            for (ordinal, extra) in await bridge.extrasElements(of: pid).enumerated() {
+                let mid = CGPoint(x: extra.frame.midX, y: extra.frame.midY)
+                let represented = merged.contains { $0.ownerPID == pid && $0.frame.contains(mid) }
+                guard !represented else { continue }
+                let info = appInfo(for: pid)
+                let scope = info.bundleID.map(ItemScope.app) ?? ItemScope.process(pid)
+                result.append(ManagedItem(
+                    id: "\(scope):detached\(ordinal)",
+                    scope: scope,
+                    bundleID: info.bundleID,
+                    systemIdentifier: nil,
+                    ownerPID: pid,
+                    name: info.localizedName ?? "Menu bar item",
+                    frame: .zero,
+                    isNativeOverflow: false,
+                    isPresent: true,
+                    elementToken: await bridge.registerDetached(extra.element, ownerPID: pid)
+                ))
+            }
+        }
+        return result
     }
 
     private func isRunning(_ pid: pid_t) -> Bool {

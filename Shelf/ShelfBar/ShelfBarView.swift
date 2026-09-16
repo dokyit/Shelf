@@ -245,7 +245,7 @@ struct ShelfBarView: View {
             state.dragOrder = []
             state.dragStartIndex = nil
             if finalOrder != alwaysHiddenItems.map(\.scope) {
-                visibility.reorderAlwaysHidden(finalOrder)
+                visibility.reorderItems(in: .alwaysHide, scopesInOrder: finalOrder, movedScope: item.scope)
             }
         }
     }

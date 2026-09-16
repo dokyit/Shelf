@@ -20,6 +20,111 @@ final class SettingsViewState: ObservableObject {
     @Published var layoutSearch = ""
 }
 
+final class LayoutReorderState: ObservableObject {
+    @Published var draggingScope: String?
+    @Published var previewSection: ItemSection?
+    @Published var previewOrder: [String]?
+    @Published var foreignScope: String?
+
+    var cardFrames: [ItemSection: CGRect] = [:]
+    var gridFrames: [ItemSection: CGRect] = [:]
+
+    func reset() {
+        draggingScope = nil
+        previewSection = nil
+        previewOrder = nil
+        foreignScope = nil
+    }
+}
+
+private final class ReorderSurface: NSView {
+    var onClick: (() -> Void)?
+    var onMenu: ((ReorderSurface) -> Void)?
+    var onDrag: ((CGPoint, Bool) -> Void)?
+    private var downAt = CGPoint.zero
+    private var dragging = false
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    override var mouseDownCanMoveWindow: Bool { false }
+
+    override func mouseDown(with event: NSEvent) {
+        downAt = event.locationInWindow
+        dragging = false
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        guard onDrag != nil else { return }
+        let point = event.locationInWindow
+        if !dragging, abs(point.x - downAt.x) + abs(point.y - downAt.y) > 6 { dragging = true }
+        if dragging { onDrag?(point, false) }
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        if dragging {
+            dragging = false
+            onDrag?(event.locationInWindow, true)
+        } else {
+            onClick?()
+        }
+    }
+
+    override func rightMouseDown(with event: NSEvent) { onMenu?(self) }
+    override func menu(for event: NSEvent) -> NSMenu? { nil }
+}
+
+private struct ReorderSurfaceRepresentable: NSViewRepresentable {
+    var onClick: () -> Void
+    var onMenu: (ReorderSurface) -> Void
+    var onDrag: ((CGPoint, Bool) -> Void)?
+
+    func makeNSView(context: Context) -> ReorderSurface {
+        let view = ReorderSurface()
+        view.onClick = onClick
+        view.onMenu = onMenu
+        view.onDrag = onDrag
+        return view
+    }
+
+    func updateNSView(_ nsView: ReorderSurface, context: Context) {
+        nsView.onClick = onClick
+        nsView.onMenu = onMenu
+        nsView.onDrag = onDrag
+    }
+}
+
+private final class WindowFrameReporterView: NSView {
+    var onChange: ((CGRect) -> Void)?
+    override func layout() {
+        super.layout()
+        report()
+    }
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        report()
+    }
+    private func report() {
+        onChange?(convert(bounds, to: nil))
+    }
+}
+
+private struct WindowFrameReporter: NSViewRepresentable {
+    var onChange: (CGRect) -> Void
+    func makeNSView(context: Context) -> WindowFrameReporterView {
+        let view = WindowFrameReporterView()
+        view.onChange = onChange
+        return view
+    }
+    func updateNSView(_ nsView: WindowFrameReporterView, context: Context) {
+        nsView.onChange = onChange
+    }
+}
+
+private final class MenuActionProxy: NSObject {
+    let handler: () -> Void
+    init(_ handler: @escaping () -> Void) { self.handler = handler }
+    @objc func performMenuAction() { handler() }
+}
+
 struct SettingsView: View {
     @ObservedObject var inventory: MenuBarInventory
     @ObservedObject var visibility: VisibilityManager
@@ -113,6 +218,7 @@ private struct LayoutPage: View {
     var showShelf: () -> Void
     @Binding var selectedItemID: String?
     @Binding var search: String
+    @StateObject private var reorderState = LayoutReorderState()
 
     private var ownBundleID: String {
         Bundle.main.bundleIdentifier ?? "com.pinnyutility.Shelf"
@@ -138,6 +244,45 @@ private struct LayoutPage: View {
             }
     }
 
+    private func displayItems(for section: ItemSection) -> [ManagedItem] {
+        var base = items(for: section)
+        if let dragging = reorderState.draggingScope,
+           reorderState.previewOrder != nil,
+           reorderState.previewSection != section {
+            base.removeAll { $0.scope == dragging }
+        }
+        if reorderState.previewSection == section,
+           let foreign = reorderState.foreignScope,
+           let item = inventory.items.first(where: { $0.scope == foreign }),
+           !base.contains(where: { $0.scope == item.scope }) {
+            base.append(item)
+        }
+        guard let order = reorderState.previewOrder,
+              reorderState.previewSection == section else { return base }
+        return base.sorted {
+            let ai = order.firstIndex(of: $0.scope) ?? .max
+            let bi = order.firstIndex(of: $1.scope) ?? .max
+            if ai != bi { return ai < bi }
+            return $0.name < $1.name
+        }
+    }
+
+    private func sectionScopes(for section: ItemSection) -> [String] {
+        items(for: section).map(\.scope)
+    }
+
+    private func commitReorder(_ section: ItemSection, movedScope: String, scopes: [String]) {
+        reorderState.reset()
+        guard scopes != sectionScopes(for: section) else { return }
+        visibility.reorderItems(in: section, scopesInOrder: scopes, movedScope: movedScope)
+    }
+
+    private func commitForeign(_ section: ItemSection, scope: String, scopes: [String]) {
+        reorderState.reset()
+        visibility.setSection(scope, to: section)
+        visibility.reorderItems(in: section, scopesInOrder: scopes, movedScope: scope)
+    }
+
     private func effectiveSection(of item: ManagedItem) -> ItemSection {
         if item.bundleID == ownBundleID || isLocked(item) { return .alwaysShow }
         return visibility.layout.section(for: item.scope)
@@ -149,7 +294,7 @@ private struct LayoutPage: View {
     }
 
     private func isDraggable(_ item: ManagedItem) -> Bool {
-        item.bundleID != ownBundleID && item.isManageable && !isLocked(item)
+        return item.bundleID != ownBundleID && item.isManageable && !isLocked(item)
     }
 
     private func linkedCount(for item: ManagedItem) -> Int {
@@ -174,15 +319,19 @@ private struct LayoutPage: View {
                 ForEach(ItemSection.allCases) { section in
                     SectionCard(
                         section: section,
-                        items: items(for: section),
+                        items: displayItems(for: section),
                         icons: icons,
                         visibility: visibility,
+                        reorderState: reorderState,
                         selectedItemID: $selectedItemID,
                         isDraggable: isDraggable,
                         linkedCount: linkedCount,
+                        scopesFor: sectionScopes,
                         lookupItem: { scope in
                             inventory.items.first { $0.scope == scope }
-                        }
+                        },
+                        onReorder: { scope, scopes in commitReorder(section, movedScope: scope, scopes: scopes) },
+                        onForeign: { scope, scopes in commitForeign(section, scope: scope, scopes: scopes) }
                     )
                 }
                 if let selectedItem {
@@ -306,14 +455,22 @@ private struct LayoutPage: View {
 }
 
 private struct SectionCard: View {
+    static let tileWidth: CGFloat = 96
+    static let tileHeight: CGFloat = 92
+    static let tileSpacing: CGFloat = 10
+
     let section: ItemSection
     let items: [ManagedItem]
     @ObservedObject var icons: ItemIconCache
     @ObservedObject var visibility: VisibilityManager
+    @ObservedObject var reorderState: LayoutReorderState
     @Binding var selectedItemID: String?
     let isDraggable: (ManagedItem) -> Bool
     let linkedCount: (ManagedItem) -> Int
+    let scopesFor: (ItemSection) -> [String]
     let lookupItem: (String) -> ManagedItem?
+    let onReorder: (String, [String]) -> Void
+    let onForeign: (String, [String]) -> Void
 
     private var symbol: String {
         switch section {
@@ -332,104 +489,192 @@ private struct SectionCard: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack(spacing: 8) {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(spacing: 10) {
                 Image(systemName: symbol)
+                    .font(.system(size: 13, weight: .semibold))
                     .foregroundStyle(.secondary)
-                Text(section.title)
-                    .font(.headline)
+                    .frame(width: 26, height: 26)
+                    .background(.quaternary, in: RoundedRectangle(cornerRadius: 7))
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(section.title)
+                        .font(.headline)
+                    Text(explanation)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
                 Spacer()
                 Text("\(items.count)")
+                    .font(.caption.weight(.semibold))
                     .foregroundStyle(.secondary)
-                    .font(.callout)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 3)
+                    .background(.quaternary, in: Capsule())
             }
-            Text(explanation)
-                .font(.callout)
-                .foregroundStyle(.secondary)
             if items.isEmpty {
-                Text("Drop items here")
+                Text("Drag items here")
                     .font(.callout)
                     .foregroundStyle(.tertiary)
                     .frame(maxWidth: .infinity)
-                    .padding(.vertical, 16)
+                    .padding(.vertical, 20)
+                    .background(WindowFrameReporter { reorderState.gridFrames[section] = $0 })
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 10, style: .continuous)
+                            .strokeBorder(style: StrokeStyle(lineWidth: 1, dash: [6, 5]))
+                            .foregroundStyle(.tertiary)
+                    )
             } else {
                 LazyVGrid(
-                    columns: [GridItem(.adaptive(minimum: 72), spacing: 8)],
-                    spacing: 8
+                    columns: [GridItem(.adaptive(minimum: Self.tileWidth), spacing: Self.tileSpacing)],
+                    spacing: Self.tileSpacing
                 ) {
                     ForEach(items) { item in
                         tile(for: item)
                     }
                 }
+                .background(WindowFrameReporter { reorderState.gridFrames[section] = $0 })
+                .animation(.default, value: items.map(\.id))
             }
         }
-        .padding(14)
-        .background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: 12))
-        .dropDestination(for: String.self) { scopes, _ in
-            var handled = false
-            for scope in scopes {
-                if let item = lookupItem(scope), isDraggable(item) {
-                    visibility.setSection(scope, to: section)
-                    handled = true
-                }
-            }
-            return handled
+        .padding(18)
+        .background(.quaternary.opacity(0.35), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .background(WindowFrameReporter { reorderState.cardFrames[section] = $0 })
+        .overlay(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .strokeBorder(Color.primary.opacity(0.06))
+        )
+    }
+
+    private func insertionIndex(at point: CGPoint, in targetSection: ItemSection) -> Int {
+        guard let grid = reorderState.gridFrames[targetSection] else { return scopesFor(targetSection).count }
+        let strideX = Self.tileWidth + Self.tileSpacing
+        let strideY = Self.tileHeight + Self.tileSpacing
+        let columns = max(1, Int((grid.width + Self.tileSpacing) / strideX))
+        var col = min(max(0, Int((point.x - grid.minX) / strideX)), columns - 1)
+        let row = max(0, Int((grid.maxY - point.y) / strideY))
+        if point.x - grid.minX - CGFloat(col) * strideX > Self.tileWidth / 2 { col += 1 }
+        return min(row * columns + col, scopesFor(targetSection).count)
+    }
+
+    private func handleDrag(_ item: ManagedItem, point: CGPoint, ended: Bool) {
+        if reorderState.draggingScope == nil { reorderState.draggingScope = item.scope }
+        guard reorderState.draggingScope == item.scope else { return }
+        guard let targetSection = ItemSection.allCases.first(where: {
+            reorderState.cardFrames[$0]?.insetBy(dx: -8, dy: -8).contains(point) == true
+        }) else {
+            if ended { reorderState.reset() } else { reorderState.previewOrder = nil }
+            return
         }
+        var order = scopesFor(targetSection)
+        let index = insertionIndex(at: point, in: targetSection)
+        if order.contains(item.scope) {
+            order.removeAll { $0 == item.scope }
+            order.insert(item.scope, at: min(index, order.count))
+            reorderState.foreignScope = nil
+        } else {
+            order.insert(item.scope, at: min(index, order.count))
+            reorderState.foreignScope = item.scope
+        }
+        if ended {
+            if reorderState.foreignScope == item.scope {
+                onForeign(item.scope, order)
+            } else {
+                onReorder(item.scope, order)
+            }
+        } else {
+            reorderState.previewSection = targetSection
+            reorderState.previewOrder = order
+        }
+    }
+
+    private func showMoveMenu(for item: ManagedItem, at view: ReorderSurface) {
+        let menu = NSMenu()
+        let header = NSMenuItem(title: "Move to", action: nil, keyEquivalent: "")
+        header.isEnabled = false
+        menu.addItem(header)
+        for destination in ItemSection.allCases {
+            let proxy = MenuActionProxy { [visibility] in
+                visibility.setSection(item.scope, to: destination)
+            }
+            let entry = NSMenuItem(
+                title: destination.title,
+                action: #selector(MenuActionProxy.performMenuAction),
+                keyEquivalent: ""
+            )
+            entry.target = proxy
+            entry.representedObject = proxy
+            entry.isEnabled = isDraggable(item)
+            menu.addItem(entry)
+        }
+        menu.popUp(positioning: nil, at: NSPoint(x: 4, y: view.bounds.height - 2), in: view)
     }
 
     @ViewBuilder
     private func tile(for item: ManagedItem) -> some View {
-        let content = VStack(spacing: 5) {
-            Image(nsImage: icons.icon(for: item))
+        LayoutTile(
+            item: item,
+            icon: icons.icon(for: item),
+            selected: selectedItemID == item.id,
+            linkedCount: linkedCount(item)
+        )
+        .opacity(reorderState.draggingScope == item.scope ? 0.4 : 1)
+        .overlay(ReorderSurfaceRepresentable(
+            onClick: { selectedItemID = item.id },
+            onMenu: { view in showMoveMenu(for: item, at: view) },
+            onDrag: isDraggable(item) ? { point, ended in handleDrag(item, point: point, ended: ended) } : nil
+        ))
+    }
+}
+
+private struct LayoutTile: View {
+    static let width: CGFloat = 96
+
+    let item: ManagedItem
+    let icon: NSImage
+    let selected: Bool
+    let linkedCount: Int
+
+    private var shape: RoundedRectangle {
+        RoundedRectangle(cornerRadius: 10, style: .continuous)
+    }
+
+    var body: some View {
+        VStack(spacing: 6) {
+            Image(nsImage: icon)
                 .resizable()
                 .aspectRatio(contentMode: .fit)
-                .frame(width: 24, height: 24)
+                .frame(width: 28, height: 28)
             Text(item.name)
-                .font(.caption2)
+                .font(.caption)
                 .lineLimit(2)
                 .multilineTextAlignment(.center)
                 .frame(maxWidth: .infinity)
-            HStack(spacing: 4) {
-                if linkedCount(item) > 1 {
-                    Badge(text: "Linked")
-                }
-                if item.isNativeOverflow {
-                    Badge(text: "Overflow")
-                }
-                if (item.systemIdentifier != nil && !item.isManageable) || !item.isPreservable {
-                    Badge(text: "macOS")
-                }
-            }
+            badgeRow
         }
-        .frame(width: 72, height: 74)
-        .background(
-            RoundedRectangle(cornerRadius: 8)
-                .fill(selectedItemID == item.id ? Color.accentColor.opacity(0.15) : Color.clear)
-        )
+        .padding(.horizontal, 6)
+        .padding(.vertical, 10)
+        .frame(width: Self.width, height: SectionCard.tileHeight)
+        .background(shape.fill(selected ? Color.accentColor.opacity(0.18) : Color.primary.opacity(0.03)))
+        .overlay(shape.strokeBorder(selected ? Color.accentColor.opacity(0.6) : Color.primary.opacity(0.05), lineWidth: 1))
         .contentShape(Rectangle())
-        .onTapGesture { selectedItemID = item.id }
         .help(item.name)
         .accessibilityLabel(item.name)
-
-        if isDraggable(item) {
-            content
-                .draggable(item.scope)
-                .contextMenu { moveToMenu(for: item) }
-        } else {
-            content.contextMenu { moveToMenu(for: item) }
-        }
     }
 
     @ViewBuilder
-    private func moveToMenu(for item: ManagedItem) -> some View {
-        Menu("Move to") {
-            ForEach(ItemSection.allCases) { destination in
-                Button(destination.title) {
-                    visibility.setSection(item.scope, to: destination)
-                }
-                .disabled(!isDraggable(item))
+    private var badgeRow: some View {
+        HStack(spacing: 4) {
+            if linkedCount > 1 {
+                Badge(text: "Linked")
+            }
+            if item.isNativeOverflow {
+                Badge(text: "Overflow")
+            }
+            if (item.systemIdentifier != nil && !item.isManageable) || !item.isPreservable {
+                Badge(text: "macOS")
             }
         }
+        .frame(height: 14)
     }
 }
 

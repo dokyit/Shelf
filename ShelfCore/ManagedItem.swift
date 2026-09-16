@@ -78,7 +78,7 @@ public enum SystemMenuBarItem {
         Known(code: 2, identifier: "com.apple.menuextra.clock", displayName: "Clock", locked: true),
         Known(code: 3, identifier: "com.apple.menuextra.displays", displayName: "Displays", locked: false),
         Known(code: 4, identifier: "com.apple.menuextra.textinput", displayName: "Input Menu", locked: false),
-        Known(code: 5, identifier: "com.apple.menuextra.sound", displayName: "Sound", locked: false),
+        Known(code: 5, identifier: "com.apple.menuextra.sound", displayName: "Sound", locked: true),
         Known(code: 6, identifier: "com.apple.menuextra.wifi", displayName: "Wi-Fi", locked: true),
         Known(code: 7, identifier: "com.apple.menuextra.screenmirroring", displayName: "Screen Mirroring", locked: false),
         Known(code: 8, identifier: "com.apple.menuextra.controlcenter", displayName: "Control Center", locked: true)

@@ -81,7 +81,6 @@ final class VisibilityManager: ObservableObject {
     private var savedLayout: ShelfLayout
     private var pendingApply = false
     private var applyTask: Task<Void, Never>?
-    private var revealWatchTask: Task<Void, Never>?
     private var activatingScopes: Set<String> = []
     private var observers: [NSObjectProtocol] = []
     private var settingsHandler: (() -> Void)?
@@ -169,7 +168,6 @@ final class VisibilityManager: ObservableObject {
             NSWorkspace.shared.notificationCenter.removeObserver(observer)
         }
         observers = []
-        revealWatchTask?.cancel()
         applyTask?.cancel()
         Task { await engine.suspend() }
     }
@@ -220,7 +218,6 @@ final class VisibilityManager: ObservableObject {
         let previous = blocker
         refreshBlocker()
         if blocker == .bartenderRunning, previous != .bartenderRunning {
-            revealWatchTask?.cancel()
             temporarilyRevealedScopes = []
             Task { await engine.suspend() }
             isRestricted = false
@@ -336,7 +333,7 @@ final class VisibilityManager: ObservableObject {
             guard pressed else {
                 return .failure("\(item.name) is visible in the menu bar now — click it there.")
             }
-            startRevealWatch(for: target)
+            endReveal(scope: item.scope)
             return .success
         }
         activatingScopes.insert(item.scope)
@@ -351,24 +348,50 @@ final class VisibilityManager: ObservableObject {
 
     private var isReordering = false
 
-    func reorderAlwaysHidden(_ scopesInOrder: [String]) {
+    func reorderItems(in section: ItemSection, scopesInOrder: [String], movedScope: String? = nil) {
         for (index, scope) in scopesInOrder.enumerated() {
-            if var rule = layout.rules[scope], rule.section == .alwaysHide {
+            if var rule = layout.rules[scope], rule.section == section {
                 rule.order = index
                 layout.rules[scope] = rule
+            } else if section == .alwaysShow, layout.rules[scope] == nil {
+                layout.rules[scope] = ItemRule(section: .alwaysShow, order: index)
             }
         }
         savedLayout = layout
         persist()
-        guard !isReordering, scopesInOrder.count > 1 else { return }
+        guard !isReordering, scopesInOrder.count > 1, let movedScope else { return }
         isReordering = true
         Task { [weak self] in
-            await self?.applyHiddenOrderToBar(scopesInOrder)
+            switch section {
+            case .alwaysShow:
+                await self?.applyVisibleOrderToBar(scopesInOrder, movedScope: movedScope)
+            case .alwaysHide:
+                await self?.applyHiddenOrderToBar(scopesInOrder, movedScope: movedScope)
+            case .onShelf:
+                break
+            }
             self?.isReordering = false
         }
     }
 
-    private func applyHiddenOrderToBar(_ scopes: [String]) async {
+    private func applyVisibleOrderToBar(_ scopes: [String], movedScope: String) async {
+        guard accessibilityTrusted, blocker == nil else { return }
+        activatingScopes.formUnion(scopes)
+        defer { activatingScopes.subtract(scopes) }
+        let deadline = Date().addingTimeInterval(3)
+        while Date() < deadline {
+            if let fresh = await inventory?.captureFreshItems() {
+                let present = fresh.filter {
+                    scopes.contains($0.scope) && $0.isPresent && !$0.isNativeOverflow && $0.frame.width > 0
+                }
+                if present.count == scopes.count { break }
+            }
+            try? await Task.sleep(nanoseconds: 200_000_000)
+        }
+        await placeMovedItem(scopes, movedScope: movedScope)
+    }
+
+    private func applyHiddenOrderToBar(_ scopes: [String], movedScope: String) async {
         guard accessibilityTrusted, blocker == nil else { return }
         activatingScopes.formUnion(scopes)
         temporarilyRevealedScopes.formUnion(scopes)
@@ -390,19 +413,38 @@ final class VisibilityManager: ObservableObject {
             try? await Task.sleep(nanoseconds: 200_000_000)
         }
         guard present.count > 1 else { return }
-        for index in 1..<scopes.count {
-            guard let fresh = await inventory?.captureFreshItems(),
-                  let prev = fresh.first(where: { $0.scope == scopes[index - 1] }),
-                  let cur = fresh.first(where: { $0.scope == scopes[index] }),
-                  prev.isPresent, cur.isPresent,
-                  prev.frame.width > 0, cur.frame.width > 0,
-                  !prev.isNativeOverflow, !cur.isNativeOverflow else { continue }
-            if cur.frame.minX < prev.frame.minX {
-                let target = prev.frame.maxX + cur.frame.width / 2 + 6
-                _ = await inventory?.dragItem(cur, toX: target)
-                try? await Task.sleep(nanoseconds: 500_000_000)
-            }
+        await placeMovedItem(scopes, movedScope: movedScope)
+    }
+
+    private func placeMovedItem(_ scopes: [String], movedScope: String) async {
+        guard let index = scopes.firstIndex(of: movedScope),
+              let fresh = await inventory?.captureFreshItems(),
+              let item = fresh.first(where: { $0.scope == movedScope }),
+              item.isPresent, item.frame.width > 0, !item.isNativeOverflow,
+              item.isManageable, item.ownerPID != getpid() else { return }
+        func visible(_ scope: String) -> ManagedItem? {
+            fresh.first { $0.scope == scope && $0.isPresent && $0.frame.width > 0 && !$0.isNativeOverflow }
         }
+        var left: ManagedItem?
+        for j in stride(from: index - 1, through: 0, by: -1) {
+            if let n = visible(scopes[j]) { left = n; break }
+        }
+        var right: ManagedItem?
+        for j in (index + 1)..<scopes.count {
+            if let n = visible(scopes[j]) { right = n; break }
+        }
+        let inPlace = (left == nil || item.frame.minX > left!.frame.maxX)
+            && (right == nil || item.frame.maxX < right!.frame.minX)
+        guard !inPlace else { return }
+        let target: CGFloat
+        if let left {
+            target = left.frame.maxX + 4
+        } else if let right {
+            target = right.frame.minX - 4
+        } else {
+            return
+        }
+        _ = await inventory?.dragItem(item, toX: target)
     }
 
     func noteOutsideClick() {
@@ -422,37 +464,13 @@ final class VisibilityManager: ObservableObject {
 
     func endReveal(scope: String) {
         guard temporarilyRevealedScopes.remove(scope) != nil else { return }
-        revealWatchTask?.cancel()
         requestApply()
     }
 
     func endAllReveals() {
         guard !temporarilyRevealedScopes.isEmpty else { return }
         temporarilyRevealedScopes = []
-        revealWatchTask?.cancel()
         requestApply()
-    }
-
-    private func startRevealWatch(for item: ManagedItem) {
-        revealWatchTask?.cancel()
-        revealWatchTask = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: 500_000_000)
-            var menuSeen = false
-            for _ in 0..<180 {
-                if Task.isCancelled { return }
-                guard let self else { return }
-                let open = await self.inventory?.hasOpenMenu(item) ?? false
-                if open {
-                    menuSeen = true
-                } else if menuSeen {
-                    self.endReveal(scope: item.scope)
-                    return
-                }
-                try? await Task.sleep(nanoseconds: 300_000_000)
-            }
-            guard let self, !Task.isCancelled else { return }
-            self.endReveal(scope: item.scope)
-        }
     }
 
     private func persist() {
