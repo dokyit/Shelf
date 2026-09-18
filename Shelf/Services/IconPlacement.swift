@@ -80,6 +80,14 @@ enum IconPlacement {
 
     private static func postCommandDrag(from source: CGPoint, to target: CGPoint) async -> Bool {
         await Task.detached {
+            let originalPointer = CGEvent(source: nil)?.location
+            let display = CGMainDisplayID()
+            CGDisplayHideCursor(display)
+            defer {
+                if let originalPointer { CGWarpMouseCursorPosition(originalPointer) }
+                CGDisplayShowCursor(display)
+            }
+
             let eventSource = CGEventSource(stateID: .hidSystemState)
             guard let down = CGEvent(
                 mouseEventSource: eventSource,
@@ -89,24 +97,18 @@ enum IconPlacement {
             ) else { return false }
             down.flags = .maskCommand
             down.post(tap: .cghidEventTap)
-            try? await Task.sleep(nanoseconds: 150_000_000)
-            for step in 1...12 {
-                if Task.isCancelled { return false }
-                let progress = CGFloat(step) / 12
-                let point = CGPoint(
-                    x: source.x + (target.x - source.x) * progress,
-                    y: source.y + (target.y - source.y) * progress
-                )
-                guard let drag = CGEvent(
-                    mouseEventSource: eventSource,
-                    mouseType: .leftMouseDragged,
-                    mouseCursorPosition: point,
-                    mouseButton: .left
-                ) else { return false }
-                drag.flags = .maskCommand
-                drag.post(tap: .cghidEventTap)
-                try? await Task.sleep(nanoseconds: 30_000_000)
-            }
+            try? await Task.sleep(nanoseconds: 120_000_000)
+
+            guard let drag = CGEvent(
+                mouseEventSource: eventSource,
+                mouseType: .leftMouseDragged,
+                mouseCursorPosition: target,
+                mouseButton: .left
+            ) else { return false }
+            drag.flags = .maskCommand
+            drag.post(tap: .cghidEventTap)
+            try? await Task.sleep(nanoseconds: 90_000_000)
+
             guard let up = CGEvent(
                 mouseEventSource: eventSource,
                 mouseType: .leftMouseUp,

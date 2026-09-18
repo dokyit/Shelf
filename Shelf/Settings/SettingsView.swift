@@ -232,16 +232,37 @@ private struct LayoutPage: View {
     }
 
     private func items(for section: ItemSection) -> [ManagedItem] {
-        presentItems
-            .filter { effectiveSection(of: $0) == section }
-            .sorted {
-                let lx = $0.frame.width > 0 ? $0.frame.minX : .greatestFiniteMagnitude
-                let rx = $1.frame.width > 0 ? $1.frame.minX : .greatestFiniteMagnitude
-                if lx != rx { return lx < rx }
-                let left = visibility.layout.rules[$0.scope]?.order ?? 0
-                let right = visibility.layout.rules[$1.scope]?.order ?? 0
-                return left == right ? $0.name < $1.name : left < right
+        let sectionItems = presentItems.filter { effectiveSection(of: $0) == section }
+        let sorted = sectionItems.sorted { lhs, rhs in
+            let leftOrder = visibility.layout.rules[lhs.scope]?.order
+            let rightOrder = visibility.layout.rules[rhs.scope]?.order
+            if leftOrder != rightOrder {
+                if let leftOrder, let rightOrder { return leftOrder < rightOrder }
+                if leftOrder != nil { return true }
+                if rightOrder != nil { return false }
             }
+            let lx = lhs.frame.width > 0 ? lhs.frame.minX : .greatestFiniteMagnitude
+            let rx = rhs.frame.width > 0 ? rhs.frame.minX : .greatestFiniteMagnitude
+            if lx != rx { return lx < rx }
+            return lhs.name < rhs.name
+        }
+        guard section == .alwaysShow else { return sorted }
+        let movable = sorted.filter { trailingRank(for: $0) == nil }
+        let trailing = sorted.filter { trailingRank(for: $0) != nil }
+            .sorted { trailingRank(for: $0)! < trailingRank(for: $1)! }
+        return movable + trailing
+    }
+
+    private func trailingRank(for item: ManagedItem) -> Int? {
+        if item.bundleID == ownBundleID { return 3 }
+        switch item.systemIdentifier {
+        case "com.apple.menuextra.sound": return 0
+        case "com.apple.menuextra.wifi": return 1
+        case "com.apple.menuextra.battery": return 2
+        case "com.apple.menuextra.controlcenter": return 4
+        case "com.apple.menuextra.clock": return 5
+        default: return nil
+        }
     }
 
     private func displayItems(for section: ItemSection) -> [ManagedItem] {
@@ -308,11 +329,11 @@ private struct LayoutPage: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("Your menu bar, on your terms.")
-                        .font(.title2)
-                        .bold()
-                    Text("Choose what stays visible, what waits on the shelf, and what stays out of sight.")
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Menu Bar Layout")
+                        .font(.title2.weight(.semibold))
+                    Text("Drag items to reorder them or move them between visibility groups.")
+                        .font(.callout)
                         .foregroundStyle(.secondary)
                 }
                 bannerArea
@@ -326,6 +347,7 @@ private struct LayoutPage: View {
                         selectedItemID: $selectedItemID,
                         isDraggable: isDraggable,
                         linkedCount: linkedCount,
+                        isPinnedTrailing: { trailingRank(for: $0) != nil },
                         scopesFor: sectionScopes,
                         lookupItem: { scope in
                             inventory.items.first { $0.scope == scope }
@@ -455,9 +477,9 @@ private struct LayoutPage: View {
 }
 
 private struct SectionCard: View {
-    static let tileWidth: CGFloat = 96
-    static let tileHeight: CGFloat = 92
-    static let tileSpacing: CGFloat = 10
+    static let tileWidth: CGFloat = 86
+    static let tileHeight: CGFloat = 78
+    static let tileSpacing: CGFloat = 8
 
     let section: ItemSection
     let items: [ManagedItem]
@@ -467,6 +489,7 @@ private struct SectionCard: View {
     @Binding var selectedItemID: String?
     let isDraggable: (ManagedItem) -> Bool
     let linkedCount: (ManagedItem) -> Int
+    let isPinnedTrailing: (ManagedItem) -> Bool
     let scopesFor: (ItemSection) -> [String]
     let lookupItem: (String) -> ManagedItem?
     let onReorder: (String, [String]) -> Void
@@ -536,12 +559,12 @@ private struct SectionCard: View {
                 .animation(.default, value: items.map(\.id))
             }
         }
-        .padding(18)
-        .background(.quaternary.opacity(0.35), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .padding(14)
+        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
         .background(WindowFrameReporter { reorderState.cardFrames[section] = $0 })
         .overlay(
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .strokeBorder(Color.primary.opacity(0.06))
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .strokeBorder(Color.primary.opacity(0.09))
         )
     }
 
@@ -566,12 +589,24 @@ private struct SectionCard: View {
             return
         }
         var order = scopesFor(targetSection)
-        let index = insertionIndex(at: point, in: targetSection)
+        var index = insertionIndex(at: point, in: targetSection)
         if order.contains(item.scope) {
             order.removeAll { $0 == item.scope }
+            if targetSection == .alwaysShow {
+                let firstPinned = order.firstIndex { scope in
+                    lookupItem(scope).map(isPinnedTrailing) == true
+                } ?? order.count
+                index = min(index, firstPinned)
+            }
             order.insert(item.scope, at: min(index, order.count))
             reorderState.foreignScope = nil
         } else {
+            if targetSection == .alwaysShow {
+                let firstPinned = order.firstIndex { scope in
+                    lookupItem(scope).map(isPinnedTrailing) == true
+                } ?? order.count
+                index = min(index, firstPinned)
+            }
             order.insert(item.scope, at: min(index, order.count))
             reorderState.foreignScope = item.scope
         }
@@ -627,7 +662,7 @@ private struct SectionCard: View {
 }
 
 private struct LayoutTile: View {
-    static let width: CGFloat = 96
+    static let width: CGFloat = 86
 
     let item: ManagedItem
     let icon: NSImage
@@ -643,16 +678,16 @@ private struct LayoutTile: View {
             Image(nsImage: icon)
                 .resizable()
                 .aspectRatio(contentMode: .fit)
-                .frame(width: 28, height: 28)
+                .frame(width: 24, height: 24)
             Text(item.name)
                 .font(.caption)
-                .lineLimit(2)
+                .lineLimit(1)
                 .multilineTextAlignment(.center)
                 .frame(maxWidth: .infinity)
             badgeRow
         }
         .padding(.horizontal, 6)
-        .padding(.vertical, 10)
+        .padding(.vertical, 8)
         .frame(width: Self.width, height: SectionCard.tileHeight)
         .background(shape.fill(selected ? Color.accentColor.opacity(0.18) : Color.primary.opacity(0.03)))
         .overlay(shape.strokeBorder(selected ? Color.accentColor.opacity(0.6) : Color.primary.opacity(0.05), lineWidth: 1))
