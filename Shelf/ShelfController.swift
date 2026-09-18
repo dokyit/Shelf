@@ -18,6 +18,8 @@ final class ShelfController: NSObject, ObservableObject {
     private var preservedSources: [String: ManagedItem] = [:]
     private var panel: ShelfBarPanel?
     private var outsideMonitor: Any?
+    private var reconcileOrderTask: Task<Void, Never>?
+    private var didScheduleInitialOrderReconcile = false
 
     init(inventory: MenuBarInventory, visibility: VisibilityManager) {
         self.inventory = inventory
@@ -25,11 +27,9 @@ final class ShelfController: NSObject, ObservableObject {
         iconItem = NSStatusBar.system.statusItem(withLength: 28)
         super.init()
         configureIconItem()
-        visibility.onLayoutReorder = { [weak self] section, scope, scopes in
+        visibility.onLayoutReorder = { [weak self] section, _, _ in
             guard section == .alwaysShow else { return }
-            Task { @MainActor [weak self] in
-                await self?.movePreservedStatusItem(scope: scope, scopes: scopes)
-            }
+            self?.scheduleAlwaysShowReconcile()
         }
     }
 
@@ -116,15 +116,55 @@ final class ShelfController: NSObject, ObservableObject {
             preservedSources.removeValue(forKey: key)
         }
 
-        if !newlyCreatedScopes.isEmpty {
-            let order = desiredAlwaysShowScopes()
-            Task { @MainActor [weak self] in
-                try? await Task.sleep(nanoseconds: 180_000_000)
-                guard let self, !Task.isCancelled else { return }
-                for scope in newlyCreatedScopes {
-                    await self.movePreservedStatusItem(scope: scope, scopes: order)
-                }
+        if !didScheduleInitialOrderReconcile,
+           visibility.isRestricted,
+           !desiredAlwaysShowScopes().isEmpty {
+            didScheduleInitialOrderReconcile = true
+            scheduleAlwaysShowReconcile(delay: 350_000_000)
+        } else if !newlyCreatedScopes.isEmpty {
+            scheduleAlwaysShowReconcile(delay: 180_000_000)
+        }
+    }
+
+    private func scheduleAlwaysShowReconcile(delay: UInt64 = 90_000_000) {
+        reconcileOrderTask?.cancel()
+        reconcileOrderTask = Task { @MainActor [weak self] in
+            if delay > 0 {
+                try? await Task.sleep(nanoseconds: delay)
             }
+            guard let self, !Task.isCancelled else { return }
+            await self.reconcileAlwaysShowOrder()
+        }
+    }
+
+    private func reconcileAlwaysShowOrder() async {
+        guard visibility.accessibilityTrusted, visibility.blocker == nil else { return }
+
+        let desired = desiredAlwaysShowScopes()
+        let movable = desired.filter { ItemScope.systemIdentifier(of: $0) == nil }
+        guard movable.count > 1 else { return }
+
+        // Use Sound as the stable right-hand boundary for user-movable app
+        // items. Build the requested order from right to left so every move is
+        // anchored to an item already placed correctly.
+        guard let soundScope = desired.first(where: {
+            ItemScope.systemIdentifier(of: $0) == "com.apple.menuextra.sound"
+        }) else { return }
+
+        var rightScope = soundScope
+        for scope in movable.reversed() {
+            guard !Task.isCancelled else { return }
+            guard let source = frameForScope(scope),
+                  let right = frameForScope(rightScope),
+                  source.width > 0, right.width > 0 else {
+                continue
+            }
+
+            let targetX = right.minX - source.width / 2 - 4
+            _ = await commandDragStatusItem(from: source, toX: targetX)
+            try? await Task.sleep(nanoseconds: 100_000_000)
+            await inventory.refresh()
+            rightScope = scope
         }
     }
 
@@ -297,7 +337,10 @@ final class ShelfController: NSObject, ObservableObject {
             icons: icons,
             mode: mode,
             onClose: { [weak self] in self?.closeShelf() },
-            openSettings: { [weak self] in self?.openSettingsHandler?() }
+            openSettings: { [weak self] in self?.openSettingsHandler?() },
+            setExternalMenuInteraction: { [weak self] active in
+                self?.panel?.suppressOutsideDismiss = active
+            }
         )
         let panel = ShelfBarPanel()
         panel.onDismiss = { [weak self] in
@@ -397,6 +440,8 @@ final class ShelfController: NSObject, ObservableObject {
     }
 
     func teardown() {
+        reconcileOrderTask?.cancel()
+        reconcileOrderTask = nil
         closePanelOnly()
         for statusItem in preservedStatusItems.values {
             NSStatusBar.system.removeStatusItem(statusItem)

@@ -3,6 +3,7 @@ import SwiftUI
 
 final class ShelfBarPanel: NSPanel {
     var onDismiss: (() -> Void)?
+    var suppressOutsideDismiss = false
     private var monitors: [Any] = []
 
     init() {
@@ -77,8 +78,17 @@ final class ShelfBarPanel: NSPanel {
         removeMonitors()
         if let monitor = NSEvent.addGlobalMonitorForEvents(
             matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown],
-            handler: { [weak self] event in
-                guard let self, self.isVisible, event.window !== self else { return }
+            handler: { [weak self] _ in
+                guard let self, self.isVisible else { return }
+
+                // Global monitors do not reliably populate event.window, even
+                // for clicks inside this nonactivating panel. Use the actual
+                // screen-space pointer location so clicking a Shelf tile does
+                // not immediately dismiss Shelf.
+                if self.frame.contains(NSEvent.mouseLocation) {
+                    return
+                }
+                guard !self.suppressOutsideDismiss else { return }
                 self.dismiss()
             }
         ) {

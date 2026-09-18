@@ -66,7 +66,12 @@ final class VisibilityManager: ObservableObject {
     @Published private(set) var isRestricted = false
     @Published private(set) var isApplying = false
     @Published private(set) var temporarilyRevealedScopes: Set<String> = []
+    @Published private(set) var menuInteractionScopes: Set<String> = []
     @Published var actionMessage: String?
+
+    var isInteractingWithMenu: Bool {
+        !menuInteractionScopes.isEmpty
+    }
 
     @Published var layout: ShelfLayout
     @Published var showShelfInMenuBar: Bool {
@@ -310,12 +315,30 @@ final class VisibilityManager: ObservableObject {
         if item.isNativeOverflow && !currentHiddenScopes().contains(item.scope) {
             return .needsOverflowReveal
         }
+
+        // Locally-signed items can be detached from MenuBarAgent while still
+        // exposing a valid AXExtrasMenuBar item. Resolve that item from its
+        // owner on every click so a stale frame/token can never hit a neighbor.
+        if item.id.hasPrefix("detached:"), !currentHiddenScopes().contains(item.scope) {
+            activatingScopes.insert(item.scope)
+            menuInteractionScopes.insert(item.scope)
+            let pressed = await inventory?.pressDetachedItem(item, button: button) ?? false
+            activatingScopes.remove(item.scope)
+            guard pressed else {
+                menuInteractionScopes.remove(item.scope)
+                return .failure("Could not open \(item.name) right now.")
+            }
+            watchMenuLifecycle(for: item, revealedScope: nil)
+            return .success
+        }
+
         if currentHiddenScopes().contains(item.scope) {
             temporarilyRevealedScopes.insert(item.scope)
             await applyLayout()
             guard temporarilyRevealedScopes.contains(item.scope) else {
                 return .failure("Shelf could not apply the layout change.")
             }
+
             var resolved: ManagedItem?
             let deadline = Date().addingTimeInterval(2)
             while Date() < deadline {
@@ -326,30 +349,82 @@ final class VisibilityManager: ObservableObject {
                     resolved = match
                     break
                 }
-                try? await Task.sleep(nanoseconds: 200_000_000)
+                try? await Task.sleep(nanoseconds: 120_000_000)
             }
+
             guard let target = resolved else {
                 temporarilyRevealedScopes.remove(item.scope)
                 await applyLayout()
+                if item.id.hasPrefix("detached:") {
+                    activatingScopes.insert(item.scope)
+                    menuInteractionScopes.insert(item.scope)
+                    let pressed = await inventory?.pressDetachedItem(item, button: button) ?? false
+                    activatingScopes.remove(item.scope)
+                    if pressed {
+                        watchMenuLifecycle(for: item, revealedScope: nil)
+                        return .success
+                    }
+                    menuInteractionScopes.remove(item.scope)
+                }
                 if let fresh = await inventory?.captureFreshItems(),
                    fresh.contains(where: { $0.scope == item.scope && $0.isNativeOverflow }) {
                     return .needsOverflowReveal
                 }
                 return .failure("\(item.name) could not be brought into the menu bar.")
             }
+
             activatingScopes.insert(item.scope)
+            menuInteractionScopes.insert(item.scope)
             let pressed = await inventory?.pressItem(target, button: button) ?? false
             activatingScopes.remove(item.scope)
             guard pressed else {
+                menuInteractionScopes.remove(item.scope)
+                endReveal(scope: item.scope)
                 return .failure("\(item.name) is visible in the menu bar now — click it there.")
             }
-            endReveal(scope: item.scope)
+
+            // Do not hide the item as soon as its menu appears. Keep it revealed
+            // until that native menu actually closes, so Shelf and the menu can
+            // remain visible together.
+            watchMenuLifecycle(for: target, revealedScope: item.scope)
             return .success
         }
+
         activatingScopes.insert(item.scope)
+        menuInteractionScopes.insert(item.scope)
         let pressed = await inventory?.pressItem(item, button: button) ?? false
         activatingScopes.remove(item.scope)
-        return pressed ? .success : .failure("Could not open \(item.name) right now.")
+        guard pressed else {
+            menuInteractionScopes.remove(item.scope)
+            return .failure("Could not open \(item.name) right now.")
+        }
+        watchMenuLifecycle(for: item, revealedScope: nil)
+        return .success
+    }
+
+    private func watchMenuLifecycle(for item: ManagedItem, revealedScope: String?) {
+        let scope = item.scope
+        let ownerPID = item.ownerPID
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            var consecutiveClosedChecks = 0
+
+            while !Task.isCancelled {
+                let open = await self.inventory?.hasOpenMenu(ownerPID: ownerPID) ?? false
+                if open {
+                    consecutiveClosedChecks = 0
+                } else {
+                    consecutiveClosedChecks += 1
+                    if consecutiveClosedChecks >= 2 { break }
+                }
+                try? await Task.sleep(nanoseconds: 120_000_000)
+            }
+
+            self.menuInteractionScopes.remove(scope)
+            if let revealedScope {
+                self.endReveal(scope: revealedScope)
+            }
+        }
     }
 
     func revealNativeOverflow() async -> Bool {
@@ -370,11 +445,16 @@ final class VisibilityManager: ObservableObject {
         savedLayout = layout
         persist()
         guard scopesInOrder.count > 1, let movedScope else { return }
-        onLayoutReorder?(section, movedScope, scopesInOrder)
 
-        // A new drop supersedes any older physical move. The settings order is
-        // already persisted above, so the actual menu bar should follow the
-        // user's latest drop instead of waiting for an earlier animation.
+        // The controller owns visible-bar reconciliation because it can see
+        // both native items and Shelf-owned preservation proxies. Do not race
+        // it with the older token-only mover.
+        if section == .alwaysShow, let onLayoutReorder {
+            onLayoutReorder(section, movedScope, scopesInOrder)
+            return
+        }
+
+        onLayoutReorder?(section, movedScope, scopesInOrder)
         reorderTask?.cancel()
         reorderTask = Task { [weak self] in
             guard let self else { return }

@@ -67,24 +67,39 @@ actor MenuBarAgentBridge {
 
     func pressItem(token: UInt64, button: MenuBarClickButton = .left) async -> Bool {
         guard let element = pressableByToken[token] else { return false }
-        if button == .left,
-           AXUIElementPerformAction(element, kAXPressAction as CFString) == .success,
-           await menuOpenedSoon(token: token) {
-            return true
+
+        if button == .left {
+            // Some SwiftUI MenuBarExtra items report kAXErrorCannotComplete even
+            // though AXPress successfully opens their menu. Judge the result by
+            // whether a menu actually appeared, not by the return code.
+            _ = AXUIElementPerformAction(element, kAXPressAction as CFString)
+            if await menuOpenedSoon(token: token) { return true }
         }
-        guard let frame = axFrame(of: element) else { return false }
+
+        guard let frame = axFrame(of: element), frame.width > 0, frame.height > 0 else { return false }
         guard click(at: CGPoint(x: frame.midX, y: frame.midY), button: button) else { return false }
         if await menuOpenedSoon(token: token) { return true }
+
         if button == .right {
-            if AXUIElementPerformAction(element, kAXPressAction as CFString) == .success,
-               await menuOpenedSoon(token: token) {
-                return true
-            }
-            guard let fresh = axFrame(of: element) else { return false }
+            _ = AXUIElementPerformAction(element, kAXPressAction as CFString)
+            if await menuOpenedSoon(token: token) { return true }
+            guard let fresh = axFrame(of: element), fresh.width > 0, fresh.height > 0 else { return false }
             guard click(at: CGPoint(x: fresh.midX, y: fresh.midY), button: .left) else { return false }
             return await menuOpenedSoon(token: token)
         }
         return false
+    }
+
+    func pressDetachedItem(ownerPID: pid_t, ordinal: Int, button: MenuBarClickButton = .left) async -> Bool {
+        let extras = extrasElements(of: ownerPID)
+        guard ordinal >= 0, ordinal < extras.count else { return false }
+        let element = extras[ordinal].element
+
+        // Detached/local items can carry a stale physical frame that overlaps a
+        // completely different status item. Never synthesize a click at that
+        // frame. AXPress targets the owning app directly.
+        _ = AXUIElementPerformAction(element, kAXPressAction as CFString)
+        return await menuOpenedSoon(element: element, ownerPID: ownerPID)
     }
 
     func dragItem(token: UInt64, toX x: CGFloat) async -> Bool {
@@ -135,6 +150,16 @@ actor MenuBarAgentBridge {
         return false
     }
 
+    private func menuOpenedSoon(element: AXUIElement, ownerPID: pid_t) async -> Bool {
+        for _ in 0..<8 {
+            if axChildren(of: element).contains(where: isVisibleMenu) || hasOpenMenu(ownerPID: ownerPID) {
+                return true
+            }
+            try? await Task.sleep(nanoseconds: 100_000_000)
+        }
+        return false
+    }
+
     private func click(at point: CGPoint, button: MenuBarClickButton = .left) -> Bool {
         let downType: CGEventType = button == .left ? .leftMouseDown : .rightMouseDown
         let upType: CGEventType = button == .left ? .leftMouseUp : .rightMouseUp
@@ -176,8 +201,26 @@ actor MenuBarAgentBridge {
             return true
         }
         guard let pid = ownerPIDByToken[token] else { return false }
-        let app = AXUIElementCreateApplication(pid)
-        return axChildren(of: app).contains(where: isVisibleMenu)
+        return hasOpenMenu(ownerPID: pid)
+    }
+
+    func hasOpenMenu(ownerPID: pid_t) -> Bool {
+        let app = AXUIElementCreateApplication(ownerPID)
+        if axChildren(of: app).contains(where: isVisibleMenu) {
+            return true
+        }
+
+        // SwiftUI MenuBarExtra menus may be nested below an application child.
+        func containsVisibleMenu(_ element: AXUIElement, depth: Int) -> Bool {
+            guard depth <= 4 else { return false }
+            if isVisibleMenu(element) { return true }
+            return axChildren(of: element).contains {
+                containsVisibleMenu($0, depth: depth + 1)
+            }
+        }
+        return axChildren(of: app).contains {
+            containsVisibleMenu($0, depth: 1)
+        }
     }
 
     private func isVisibleMenu(_ element: AXUIElement) -> Bool {

@@ -75,22 +75,33 @@ struct ShelfBarView: View {
     let mode: Mode
     var onClose: () -> Void
     var openSettings: () -> Void = {}
+    var setExternalMenuInteraction: (Bool) -> Void = { _ in }
 
     @StateObject private var state = ShelfBarState()
     @FocusState private var searchFocused: Bool
 
     private var candidates: [ManagedItem] {
         let ownPID = getpid()
-        return inventory.items.filter { item in
-            guard item.isPresent, item.ownerPID != ownPID else { return false }
-            let section = visibility.layout.section(for: item.scope)
-            switch mode {
-            case .shelf:
-                return section == .onShelf
-            case .search:
-                return section != .alwaysHide || state.includeAlwaysHidden
+        return inventory.items
+            .filter { item in
+                guard item.isPresent, item.ownerPID != ownPID else { return false }
+                let section = visibility.layout.section(for: item.scope)
+                switch mode {
+                case .shelf:
+                    return section == .onShelf
+                case .search:
+                    return section != .alwaysHide || state.includeAlwaysHidden
+                }
             }
-        }
+            .sorted { lhs, rhs in
+                let lo = visibility.layout.rules[lhs.scope]?.order ?? .max
+                let ro = visibility.layout.rules[rhs.scope]?.order ?? .max
+                if lo != ro { return lo < ro }
+                if lhs.frame.width > 0, rhs.frame.width > 0, lhs.frame.minX != rhs.frame.minX {
+                    return lhs.frame.minX < rhs.frame.minX
+                }
+                return lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
+            }
     }
 
     private var shownItems: [ManagedItem] {
@@ -251,17 +262,27 @@ struct ShelfBarView: View {
     }
 
     private func activate(_ item: ManagedItem, button: MenuBarClickButton) {
-        onClose()
+        setExternalMenuInteraction(true)
         Task { @MainActor in
             let result = await visibility.activateItem(item, button: button)
             switch result {
             case .success:
-                break
+                // Keep Shelf visible while the item's real menu is open. The
+                // visibility manager clears its interaction state when that
+                // menu closes, and the panel can resume normal outside-click
+                // dismissal at that point.
+                while visibility.isInteractingWithMenu {
+                    try? await Task.sleep(nanoseconds: 120_000_000)
+                    guard !Task.isCancelled else { break }
+                }
+                setExternalMenuInteraction(false)
             case .needsOverflowReveal:
+                setExternalMenuInteraction(false)
                 _ = await visibility.revealNativeOverflow()
                 visibility.actionMessage = "\(item.name) is inside macOS overflow — the overflow area was opened for you."
                 openSettings()
             case .failure(let error):
+                setExternalMenuInteraction(false)
                 visibility.actionMessage = error
                 openSettings()
             }

@@ -135,6 +135,13 @@ final class MenuBarInventory: ObservableObject {
         await bridge.pressItem(token: item.elementToken, button: button)
     }
 
+    func pressDetachedItem(_ item: ManagedItem, button: MenuBarClickButton = .left) async -> Bool {
+        guard item.id.hasPrefix("detached:"),
+              let ordinalText = item.id.split(separator: ":").last,
+              let ordinal = Int(ordinalText) else { return false }
+        return await bridge.pressDetachedItem(ownerPID: item.ownerPID, ordinal: ordinal, button: button)
+    }
+
     func dragItem(_ item: ManagedItem, toX x: CGFloat) async -> Bool {
         await bridge.dragItem(token: item.elementToken, toX: x)
     }
@@ -144,7 +151,14 @@ final class MenuBarInventory: ObservableObject {
     }
 
     func hasOpenMenu(_ item: ManagedItem) async -> Bool {
-        await bridge.hasOpenMenu(token: item.elementToken)
+        if item.id.hasPrefix("detached:") {
+            return await bridge.hasOpenMenu(ownerPID: item.ownerPID)
+        }
+        return await bridge.hasOpenMenu(token: item.elementToken)
+    }
+
+    func hasOpenMenu(ownerPID: pid_t) async -> Bool {
+        await bridge.hasOpenMenu(ownerPID: ownerPID)
     }
 
     private func appInfo(for pid: pid_t) -> MenuBarAppInfo {
