@@ -84,6 +84,7 @@ final class VisibilityManager: ObservableObject {
     private var activatingScopes: Set<String> = []
     private var observers: [NSObjectProtocol] = []
     private var settingsHandler: (() -> Void)?
+    var onLayoutReorder: ((ItemSection, String, [String]) -> Void)?
     private let inventoryBox = InventoryBox()
 
     private static let showShelfInMenuBarKey = "shelf.showShelfInMenuBar"
@@ -257,6 +258,7 @@ final class VisibilityManager: ObservableObject {
         }
         isApplying = true
 
+        let wasRestricted = isRestricted
         let items: [ManagedItem]? = inventory?.availability == .ready ? inventory?.items : nil
         let result = await engine.apply(
             layout: layout,
@@ -283,6 +285,14 @@ final class VisibilityManager: ObservableObject {
         }
 
         isApplying = false
+
+        // When restriction mode turns on or off, refresh immediately instead
+        // of waiting for the five-second inventory poll. This is also what
+        // lets Shelf surface/proxy locally signed status items right away.
+        if wasRestricted != isRestricted {
+            await inventory?.refresh()
+        }
+
         if pendingApply {
             pendingApply = false
             await applyLayout()
@@ -346,7 +356,7 @@ final class VisibilityManager: ObservableObject {
         await inventory?.revealNativeOverflow() ?? false
     }
 
-    private var isReordering = false
+    private var reorderTask: Task<Void, Never>?
 
     func reorderItems(in section: ItemSection, scopesInOrder: [String], movedScope: String? = nil) {
         for (index, scope) in scopesInOrder.enumerated() {
@@ -359,18 +369,25 @@ final class VisibilityManager: ObservableObject {
         }
         savedLayout = layout
         persist()
-        guard !isReordering, scopesInOrder.count > 1, let movedScope else { return }
-        isReordering = true
-        Task { [weak self] in
+        guard scopesInOrder.count > 1, let movedScope else { return }
+        onLayoutReorder?(section, movedScope, scopesInOrder)
+
+        // A new drop supersedes any older physical move. The settings order is
+        // already persisted above, so the actual menu bar should follow the
+        // user's latest drop instead of waiting for an earlier animation.
+        reorderTask?.cancel()
+        reorderTask = Task { [weak self] in
+            guard let self else { return }
             switch section {
             case .alwaysShow:
-                await self?.applyVisibleOrderToBar(scopesInOrder, movedScope: movedScope)
+                await self.applyVisibleOrderToBar(scopesInOrder, movedScope: movedScope)
             case .alwaysHide:
-                await self?.applyHiddenOrderToBar(scopesInOrder, movedScope: movedScope)
+                await self.applyHiddenOrderToBar(scopesInOrder, movedScope: movedScope)
             case .onShelf:
                 break
             }
-            self?.isReordering = false
+            guard !Task.isCancelled else { return }
+            await self.inventory?.refresh()
         }
     }
 
@@ -378,16 +395,9 @@ final class VisibilityManager: ObservableObject {
         guard accessibilityTrusted, blocker == nil else { return }
         activatingScopes.formUnion(scopes)
         defer { activatingScopes.subtract(scopes) }
-        let deadline = Date().addingTimeInterval(3)
-        while Date() < deadline {
-            if let fresh = await inventory?.captureFreshItems() {
-                let present = fresh.filter {
-                    scopes.contains($0.scope) && $0.isPresent && !$0.isNativeOverflow && $0.frame.width > 0
-                }
-                if present.count == scopes.count { break }
-            }
-            try? await Task.sleep(nanoseconds: 200_000_000)
-        }
+
+        // Visible items are already on screen. Do not wait for every item in
+        // the section to be re-discovered before honoring the drop.
         await placeMovedItem(scopes, movedScope: movedScope)
     }
 

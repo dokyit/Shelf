@@ -12,6 +12,25 @@ final class ItemIconCache: ObservableObject {
         return image
     }
 
+    func statusIcon(for item: ManagedItem) -> NSImage {
+        // Known locally-built apps can expose a perfectly valid MenuBarExtra
+        // while macOS assessment mode refuses to render it. Match the original
+        // menu-bar glyph when we know it; otherwise fall back to the app icon.
+        if item.bundleID == "local.tobias.FM26MacEditor26",
+           let image = NSImage(
+                systemSymbolName: "soccerball.circle.fill",
+                accessibilityDescription: item.name
+           ) {
+            image.size = NSSize(width: 18, height: 18)
+            image.isTemplate = true
+            return image
+        }
+        let source = icon(for: item)
+        let copy = (source.copy() as? NSImage) ?? source
+        copy.size = NSSize(width: 18, height: 18)
+        return copy
+    }
+
     private func resolve(_ item: ManagedItem) -> NSImage {
         if let bundleID = item.bundleID,
            let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) {

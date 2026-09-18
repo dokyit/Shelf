@@ -16,7 +16,6 @@ private struct SidebarMaterial: NSViewRepresentable {
 
 final class SettingsViewState: ObservableObject {
     @Published var page: SettingsView.Page = .layout
-    @Published var selectedItemID: String?
     @Published var layoutSearch = ""
 }
 
@@ -28,6 +27,7 @@ final class LayoutReorderState: ObservableObject {
 
     var cardFrames: [ItemSection: CGRect] = [:]
     var gridFrames: [ItemSection: CGRect] = [:]
+    var itemFrames: [ItemSection: [String: CGRect]] = [:]
 
     func reset() {
         draggingScope = nil
@@ -197,7 +197,6 @@ struct SettingsView: View {
                 icons: icons,
                 keepShelfVisible: keepShelfVisible,
                 showShelf: showShelf,
-                selectedItemID: $state.selectedItemID,
                 search: $state.layoutSearch
             )
         case .behavior:
@@ -216,7 +215,6 @@ private struct LayoutPage: View {
     @ObservedObject var icons: ItemIconCache
     var keepShelfVisible: () -> Void
     var showShelf: () -> Void
-    @Binding var selectedItemID: String?
     @Binding var search: String
     @StateObject private var reorderState = LayoutReorderState()
 
@@ -225,9 +223,20 @@ private struct LayoutPage: View {
     }
 
     private var presentItems: [ManagedItem] {
-        inventory.items.filter { item in
+        let filtered = inventory.items.filter { item in
             item.isPresent
                 && (search.isEmpty || item.name.localizedCaseInsensitiveContains(search))
+        }
+
+        // Preservation proxies are Shelf-owned status items. They should keep
+        // detached apps visible in the real menu bar without turning into
+        // extra "Shelf" entries in Settings.
+        var keptOwnItem = false
+        return filtered.filter { item in
+            guard item.bundleID == ownBundleID else { return true }
+            guard !keptOwnItem else { return false }
+            keptOwnItem = true
+            return true
         }
     }
 
@@ -318,14 +327,6 @@ private struct LayoutPage: View {
         return item.bundleID != ownBundleID && item.isManageable && !isLocked(item)
     }
 
-    private func linkedCount(for item: ManagedItem) -> Int {
-        inventory.items.filter { $0.scope == item.scope && $0.isPresent }.count
-    }
-
-    private var selectedItem: ManagedItem? {
-        inventory.items.first { $0.id == selectedItemID }
-    }
-
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
@@ -344,9 +345,7 @@ private struct LayoutPage: View {
                         icons: icons,
                         visibility: visibility,
                         reorderState: reorderState,
-                        selectedItemID: $selectedItemID,
                         isDraggable: isDraggable,
-                        linkedCount: linkedCount,
                         isPinnedTrailing: { trailingRank(for: $0) != nil },
                         scopesFor: sectionScopes,
                         lookupItem: { scope in
@@ -356,13 +355,6 @@ private struct LayoutPage: View {
                         onForeign: { scope, scopes in commitForeign(section, scope: scope, scopes: scopes) }
                     )
                 }
-                if let selectedItem {
-                    selectedDetail(selectedItem)
-                }
-                Text("On macOS 27, menu-bar items from the same app move together — moving one updates its linked items. Items inside macOS overflow can't always be reached directly. Some items (like Now Playing, background helpers, and locally-signed apps) are removed by macOS while Shelf is hiding items.")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
             }
             .padding(20)
         }
@@ -434,61 +426,19 @@ private struct LayoutPage: View {
             EmptyView()
         }
     }
-
-    private func selectedDetail(_ item: ManagedItem) -> some View {
-        HStack(spacing: 10) {
-            Image(nsImage: icons.icon(for: item))
-                .resizable()
-                .frame(width: 24, height: 24)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(item.name).font(.callout).bold()
-                HStack(spacing: 6) {
-                    if linkedCount(for: item) > 1 {
-                        Badge(text: "Linked app items")
-                    }
-                    if item.isNativeOverflow {
-                        Badge(text: "In macOS overflow")
-                    }
-                    if item.bundleID == ownBundleID {
-                        Badge(text: "Shelf")
-                    } else if !item.isManageable || isLocked(item) {
-                        Badge(text: "Fixed by macOS")
-                    } else if !item.isPreservable {
-                        Badge(text: "Removed by macOS while hiding")
-                    }
-                }
-            }
-            Spacer()
-            Picker("Section", selection: Binding(
-                get: { effectiveSection(of: item) },
-                set: { visibility.setSection(item.scope, to: $0) }
-            )) {
-                ForEach(ItemSection.allCases) { section in
-                    Text(section.title).tag(section)
-                }
-            }
-            .pickerStyle(.segmented)
-            .frame(width: 300)
-            .disabled(!isDraggable(item))
-        }
-        .padding(12)
-        .background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: 10))
-    }
 }
 
 private struct SectionCard: View {
-    static let tileWidth: CGFloat = 86
-    static let tileHeight: CGFloat = 78
-    static let tileSpacing: CGFloat = 8
+    static let tileWidth: CGFloat = 76
+    static let tileHeight: CGFloat = 58
+    static let tileSpacing: CGFloat = 10
 
     let section: ItemSection
     let items: [ManagedItem]
     @ObservedObject var icons: ItemIconCache
     @ObservedObject var visibility: VisibilityManager
     @ObservedObject var reorderState: LayoutReorderState
-    @Binding var selectedItemID: String?
     let isDraggable: (ManagedItem) -> Bool
-    let linkedCount: (ManagedItem) -> Int
     let isPinnedTrailing: (ManagedItem) -> Bool
     let scopesFor: (ItemSection) -> [String]
     let lookupItem: (String) -> ManagedItem?
@@ -512,14 +462,13 @@ private struct SectionCard: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            HStack(spacing: 10) {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 8) {
                 Image(systemName: symbol)
-                    .font(.system(size: 13, weight: .semibold))
+                    .font(.system(size: 12, weight: .semibold))
                     .foregroundStyle(.secondary)
-                    .frame(width: 26, height: 26)
-                    .background(.quaternary, in: RoundedRectangle(cornerRadius: 7))
-                VStack(alignment: .leading, spacing: 1) {
+                    .frame(width: 18)
+                VStack(alignment: .leading, spacing: 0) {
                     Text(section.title)
                         .font(.headline)
                     Text(explanation)
@@ -528,24 +477,16 @@ private struct SectionCard: View {
                 }
                 Spacer()
                 Text("\(items.count)")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.secondary)
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 3)
-                    .background(.quaternary, in: Capsule())
-            }
-            if items.isEmpty {
-                Text("Drag items here")
-                    .font(.callout)
+                    .font(.caption.monospacedDigit())
                     .foregroundStyle(.tertiary)
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 20)
+            }
+
+            if items.isEmpty {
+                Text("Drop items here")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+                    .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
                     .background(WindowFrameReporter { reorderState.gridFrames[section] = $0 })
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 10, style: .continuous)
-                            .strokeBorder(style: StrokeStyle(lineWidth: 1, dash: [6, 5]))
-                            .foregroundStyle(.tertiary)
-                    )
             } else {
                 LazyVGrid(
                     columns: [GridItem(.adaptive(minimum: Self.tileWidth), spacing: Self.tileSpacing)],
@@ -556,27 +497,54 @@ private struct SectionCard: View {
                     }
                 }
                 .background(WindowFrameReporter { reorderState.gridFrames[section] = $0 })
-                .animation(.default, value: items.map(\.id))
+                .animation(.snappy(duration: 0.16), value: items.map(\.id))
+            }
+
+            if section != .alwaysHide {
+                Divider()
+                    .padding(.top, 4)
             }
         }
-        .padding(14)
-        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-        .background(WindowFrameReporter { reorderState.cardFrames[section] = $0 })
-        .overlay(
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .strokeBorder(Color.primary.opacity(0.09))
+        .padding(.horizontal, 4)
+        .padding(.vertical, 6)
+        .background(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(reorderState.previewSection == section ? Color.accentColor.opacity(0.06) : Color.clear)
         )
+        .background(WindowFrameReporter { reorderState.cardFrames[section] = $0 })
     }
 
     private func insertionIndex(at point: CGPoint, in targetSection: ItemSection) -> Int {
-        guard let grid = reorderState.gridFrames[targetSection] else { return scopesFor(targetSection).count }
-        let strideX = Self.tileWidth + Self.tileSpacing
-        let strideY = Self.tileHeight + Self.tileSpacing
-        let columns = max(1, Int((grid.width + Self.tileSpacing) / strideX))
-        var col = min(max(0, Int((point.x - grid.minX) / strideX)), columns - 1)
-        let row = max(0, Int((grid.maxY - point.y) / strideY))
-        if point.x - grid.minX - CGFloat(col) * strideX > Self.tileWidth / 2 { col += 1 }
-        return min(row * columns + col, scopesFor(targetSection).count)
+        let order = scopesFor(targetSection)
+        guard !order.isEmpty else { return 0 }
+
+        let frames = reorderState.itemFrames[targetSection] ?? [:]
+        let positioned = order.enumerated().compactMap { index, scope -> (Int, CGRect)? in
+            guard let frame = frames[scope], frame.width > 0, frame.height > 0 else { return nil }
+            return (index, frame)
+        }
+        guard !positioned.isEmpty else { return order.count }
+
+        // Pick the visual row nearest the pointer, then use each icon's center
+        // as the insertion boundary. This makes a drop feel attached to the
+        // actual icons rather than to invisible card/grid boxes.
+        let nearest = positioned.min { lhs, rhs in
+            let ldy = abs(point.y - lhs.1.midY)
+            let rdy = abs(point.y - rhs.1.midY)
+            if ldy != rdy { return ldy < rdy }
+            return abs(point.x - lhs.1.midX) < abs(point.x - rhs.1.midX)
+        }!
+        let rowTolerance = max(Self.tileHeight * 0.65, 30)
+        let row = positioned
+            .filter { abs($0.1.midY - nearest.1.midY) <= rowTolerance }
+            .sorted { $0.1.midX < $1.1.midX }
+
+        if let first = row.first, point.x < first.1.midX { return first.0 }
+        for entry in row where point.x < entry.1.midX {
+            return entry.0
+        }
+        if let last = row.last { return min(last.0 + 1, order.count) }
+        return order.count
     }
 
     private func handleDrag(_ item: ManagedItem, point: CGPoint, ended: Bool) {
@@ -646,82 +614,45 @@ private struct SectionCard: View {
 
     @ViewBuilder
     private func tile(for item: ManagedItem) -> some View {
-        LayoutTile(
-            item: item,
-            icon: icons.icon(for: item),
-            selected: selectedItemID == item.id,
-            linkedCount: linkedCount(item)
-        )
-        .opacity(reorderState.draggingScope == item.scope ? 0.4 : 1)
-        .overlay(ReorderSurfaceRepresentable(
-            onClick: { selectedItemID = item.id },
-            onMenu: { view in showMoveMenu(for: item, at: view) },
-            onDrag: isDraggable(item) ? { point, ended in handleDrag(item, point: point, ended: ended) } : nil
-        ))
+        LayoutTile(item: item, icon: icons.icon(for: item))
+            .background(WindowFrameReporter { frame in
+                var frames = reorderState.itemFrames[section] ?? [:]
+                frames[item.scope] = frame
+                reorderState.itemFrames[section] = frames
+            })
+            .opacity(reorderState.draggingScope == item.scope ? 0.22 : 1)
+            .scaleEffect(reorderState.draggingScope == item.scope ? 0.94 : 1)
+            .overlay(ReorderSurfaceRepresentable(
+                onClick: {},
+                onMenu: { view in showMoveMenu(for: item, at: view) },
+                onDrag: isDraggable(item) ? { point, ended in handleDrag(item, point: point, ended: ended) } : nil
+            ))
     }
 }
 
 private struct LayoutTile: View {
-    static let width: CGFloat = 86
+    static let width: CGFloat = 76
 
     let item: ManagedItem
     let icon: NSImage
-    let selected: Bool
-    let linkedCount: Int
-
-    private var shape: RoundedRectangle {
-        RoundedRectangle(cornerRadius: 10, style: .continuous)
-    }
 
     var body: some View {
-        VStack(spacing: 6) {
+        VStack(spacing: 4) {
             Image(nsImage: icon)
                 .resizable()
                 .aspectRatio(contentMode: .fit)
-                .frame(width: 24, height: 24)
+                .frame(width: 27, height: 27)
             Text(item.name)
-                .font(.caption)
+                .font(.caption2)
                 .lineLimit(1)
+                .truncationMode(.tail)
                 .multilineTextAlignment(.center)
                 .frame(maxWidth: .infinity)
-            badgeRow
         }
-        .padding(.horizontal, 6)
-        .padding(.vertical, 8)
         .frame(width: Self.width, height: SectionCard.tileHeight)
-        .background(shape.fill(selected ? Color.accentColor.opacity(0.18) : Color.primary.opacity(0.03)))
-        .overlay(shape.strokeBorder(selected ? Color.accentColor.opacity(0.6) : Color.primary.opacity(0.05), lineWidth: 1))
         .contentShape(Rectangle())
         .help(item.name)
         .accessibilityLabel(item.name)
-    }
-
-    @ViewBuilder
-    private var badgeRow: some View {
-        HStack(spacing: 4) {
-            if linkedCount > 1 {
-                Badge(text: "Linked")
-            }
-            if item.isNativeOverflow {
-                Badge(text: "Overflow")
-            }
-            if (item.systemIdentifier != nil && !item.isManageable) || !item.isPreservable {
-                Badge(text: "macOS")
-            }
-        }
-        .frame(height: 14)
-    }
-}
-
-private struct Badge: View {
-    let text: String
-    var body: some View {
-        Text(text)
-            .font(.system(size: 9, weight: .medium))
-            .padding(.horizontal, 5)
-            .padding(.vertical, 2)
-            .background(.quaternary, in: Capsule())
-            .foregroundStyle(.secondary)
     }
 }
 

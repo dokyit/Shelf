@@ -37,6 +37,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         inventory.onChangeHandlers.append { [weak controller] in
             Task { @MainActor in
                 controller?.updateIcon()
+                controller?.updatePreservedStatusItems()
             }
         }
         visibility.attach(inventory: inventory) { [weak self] in
