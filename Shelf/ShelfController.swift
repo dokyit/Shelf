@@ -1,4 +1,5 @@
 import AppKit
+import OSLog
 import ShelfCore
 
 @MainActor
@@ -19,7 +20,10 @@ final class ShelfController: NSObject, ObservableObject {
     private var panel: ShelfBarPanel?
     private var outsideMonitor: Any?
     private var reconcileOrderTask: Task<Void, Never>?
-    private var didScheduleInitialOrderReconcile = false
+    private let orderLogger = Logger(
+        subsystem: Bundle.main.bundleIdentifier ?? "com.pinnyutility.Shelf",
+        category: "MenuBarOrdering"
+    )
 
     init(inventory: MenuBarInventory, visibility: VisibilityManager) {
         self.inventory = inventory
@@ -27,9 +31,12 @@ final class ShelfController: NSObject, ObservableObject {
         iconItem = NSStatusBar.system.statusItem(withLength: 28)
         super.init()
         configureIconItem()
-        visibility.onLayoutReorder = { [weak self] section, _, _ in
+        visibility.onLayoutReorder = { [weak self] section, movedScope, scopes in
             guard section == .alwaysShow else { return }
-            self?.scheduleAlwaysShowReconcile()
+            self?.scheduleAlwaysShowReconcile(
+                scopes: scopes,
+                movedScope: movedScope
+            )
         }
     }
 
@@ -79,7 +86,6 @@ final class ShelfController: NSObject, ObservableObject {
         }
 
         var wanted = Set<String>()
-        var newlyCreatedScopes: [String] = []
         for item in candidates {
             let key = item.id
             wanted.insert(key)
@@ -95,7 +101,6 @@ final class ShelfController: NSObject, ObservableObject {
                     .replacingOccurrences(of: ":", with: ".")
                     .replacingOccurrences(of: "/", with: ".")
                 preservedStatusItems[key] = statusItem
-                newlyCreatedScopes.append(item.scope)
             }
 
             guard let button = statusItem.button else { continue }
@@ -116,44 +121,72 @@ final class ShelfController: NSObject, ObservableObject {
             preservedSources.removeValue(forKey: key)
         }
 
-        if !didScheduleInitialOrderReconcile,
-           visibility.isRestricted,
-           !desiredAlwaysShowScopes().isEmpty {
-            didScheduleInitialOrderReconcile = true
-            scheduleAlwaysShowReconcile(delay: 350_000_000)
-        } else if !newlyCreatedScopes.isEmpty {
-            scheduleAlwaysShowReconcile(delay: 180_000_000)
-        }
+        // Important: inventory refreshes, visibility assertion changes, and
+        // preservation-proxy recreation are background maintenance. None of
+        // those paths is allowed to physically reorder the user's menu bar.
+        // NSStatusItem's autosaveName restores proxy placement on its own.
     }
 
-    private func scheduleAlwaysShowReconcile(delay: UInt64 = 90_000_000) {
+    private func scheduleAlwaysShowReconcile(
+        scopes: [String],
+        movedScope: String,
+        delay: UInt64 = 90_000_000
+    ) {
         reconcileOrderTask?.cancel()
+        orderLogger.info(
+            "User requested menu bar reorder. movedScope=\(movedScope, privacy: .public) count=\(scopes.count)"
+        )
         reconcileOrderTask = Task { @MainActor [weak self] in
             if delay > 0 {
                 try? await Task.sleep(nanoseconds: delay)
             }
             guard let self, !Task.isCancelled else { return }
-            await self.reconcileAlwaysShowOrder()
+            await self.reconcileAlwaysShowOrder(scopes)
+            if !Task.isCancelled {
+                self.orderLogger.info("User-requested menu bar reorder finished")
+            }
         }
     }
 
-    private func reconcileAlwaysShowOrder() async {
+    private func reconcileAlwaysShowOrder(_ requestedScopes: [String]) async {
         guard visibility.accessibilityTrusted, visibility.blocker == nil else { return }
 
-        let desired = desiredAlwaysShowScopes()
-        let movable = desired.filter { ItemScope.systemIdentifier(of: $0) == nil }
+        let ownScope = ItemScope.app(Bundle.main.bundleIdentifier ?? "com.pinnyutility.Shelf")
+        var seen = Set<String>()
+        let desired = requestedScopes.filter { seen.insert($0).inserted }
+        let movable = desired.filter {
+            ItemScope.systemIdentifier(of: $0) == nil && $0 != ownScope
+        }
         guard movable.count > 1 else { return }
 
-        // Use Sound as the stable right-hand boundary for user-movable app
-        // items. Build the requested order from right to left so every move is
-        // anchored to an item already placed correctly.
+        // Sound is the stable right-hand boundary for all user-movable items.
         guard let soundScope = desired.first(where: {
             ItemScope.systemIdentifier(of: $0) == "com.apple.menuextra.sound"
         }) else { return }
 
+        func physicalOrder(_ scopes: [String]) -> [String] {
+            scopes.compactMap { scope -> (String, CGRect)? in
+                guard let frame = frameForScope(scope), frame.width > 0 else { return nil }
+                return (scope, frame)
+            }
+            .sorted { $0.1.minX < $1.1.minX }
+            .map(\.0)
+        }
+
         var rightScope = soundScope
+        let trackableScopes = movable + [soundScope]
+
         for scope in movable.reversed() {
             guard !Task.isCancelled else { return }
+
+            let current = physicalOrder(trackableScopes)
+            if let sourceIndex = current.firstIndex(of: scope),
+               sourceIndex + 1 < current.count,
+               current[sourceIndex + 1] == rightScope {
+                rightScope = scope
+                continue
+            }
+
             guard let source = frameForScope(scope),
                   let right = frameForScope(rightScope),
                   source.width > 0, right.width > 0 else {
@@ -161,8 +194,11 @@ final class ShelfController: NSObject, ObservableObject {
             }
 
             let targetX = right.minX - source.width / 2 - 4
+            orderLogger.debug(
+                "Moving \(scope, privacy: .public) immediately before \(rightScope, privacy: .public)"
+            )
             _ = await commandDragStatusItem(from: source, toX: targetX)
-            try? await Task.sleep(nanoseconds: 100_000_000)
+            try? await Task.sleep(nanoseconds: 90_000_000)
             await inventory.refresh()
             rightScope = scope
         }
